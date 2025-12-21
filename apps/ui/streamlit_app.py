@@ -1,315 +1,198 @@
 import json
-import html
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-import requests
 import streamlit as st
 
-from apps.ui.client.api_client import ApiClient, BackendStatus
-from apps.ui.config import api_base_candidates
-from apps.ui.state.session_state import ensure_session_state
+from apps.ui.client.api_client import APIClient
+
+APP_TITLE = "SDD Legal AI System (PoC)"
+BACKEND_DEFAULT = "http://127.0.0.1:8000"
 
 
-# -----------------------------
-# Backend client helpers
-# -----------------------------
-def get_api_client() -> ApiClient:
-    candidates = api_base_candidates()
-    client: ApiClient | None = st.session_state.get("api_client")
-    if client:
-        client.update_candidates(candidates)
-    else:
-        client = ApiClient(candidates)
-        st.session_state.api_client = client
-    return client
-
-
-def refresh_backend_status(client: ApiClient, force: bool = False) -> BackendStatus:
-    return client.ensure_status(force_refresh=force)
-
-
-
-# -----------------------------
-# UI polish (professional grade)
-# -----------------------------
-def inject_css() -> None:
-    st.markdown(
-        """
-<style>
-/* Layout tuning */
-.block-container { padding-top: 2.0rem; padding-bottom: 2.5rem; max-width: 1180px; }
-section[data-testid="stSidebar"] { border-right: 1px solid rgba(49,51,63,0.08); }
-
-/* Typography */
-h1, h2, h3 { letter-spacing: -0.01em; }
-.small-muted { color: rgba(49,51,63,0.65); font-size: 0.92rem; }
-
-/* Chat bubbles */
-[data-testid="stChatMessage"] { padding: 0.25rem 0; }
-[data-testid="stChatMessageContent"] > div[data-testid="stMarkdownContainer"] {
-  border: 1px solid rgba(49,51,63,0.10);
-  border-radius: 14px;
-  padding: 14px 16px;
-  background: white;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-}
-[data-testid="stChatMessageContent"] > div[data-testid="stMarkdownContainer"] p { margin-bottom: 0; }
-
-/* Citation cards */
-.cite-grid { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }
-.cite-card {
-  border: 1px solid rgba(49,51,63,0.10);
-  border-radius: 14px;
-  padding: 12px 14px;
-  background: white;
-}
-.cite-title { font-weight: 650; margin-bottom: 2px; }
-.cite-meta { color: rgba(49,51,63,0.60); font-size: 0.88rem; margin-bottom: 8px; }
-.cite-snippet { color: rgba(49,51,63,0.80); font-size: 0.94rem; }
-.cite-btn { margin-top: 2px; }
-
-/* Sidebar status badge */
-.badge {
-  display: inline-block;
-  padding: 0.18rem 0.55rem;
-  border-radius: 999px;
-  font-size: 0.80rem;
-  border: 1px solid rgba(49,51,63,0.12);
-}
-.badge-ok { background: rgba(34,197,94,0.10); color: rgb(21,128,61); border-color: rgba(34,197,94,0.25); }
-.badge-err { background: rgba(239,68,68,0.10); color: rgb(153,27,27); border-color: rgba(239,68,68,0.25); }
-
-/* Buttons */
-button[kind="secondary"] { border-radius: 10px !important; }
-</style>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-# -----------------------------
-# API helpers
-# -----------------------------
-api_client = get_api_client()
-
-
-def api_get(path: str, timeout: float = 4.0) -> requests.Response:
-    return api_client.get(path, timeout=timeout)
-
-
-def api_post_stream(path: str, payload: Dict[str, Any], timeout: float = 60.0):
-    # SSE stream via POST
-    return api_client.post_stream(path, payload=payload, timeout=timeout)
-
-
-def parse_sse_lines(resp: requests.Response):
+def parse_sse_lines(resp) -> Iterator[Tuple[str, Any]]:
     """
-    Minimal SSE parser:
+    Parse a basic SSE stream where the backend sends:
+
       event: <name>
       data: <json>
+      <blank line>
+
+    Returns (event_name, parsed_json_data)
     """
     event_name = None
-    for raw in resp.iter_lines(decode_unicode=True):
-        if raw is None:
+    data_lines: List[str] = []
+
+    for raw_line in resp.iter_lines(decode_unicode=True):
+        if raw_line is None:
             continue
-        line = raw.strip()
-        if not line:
+
+        line = raw_line.strip("\r")
+
+        if line == "":
+            # End of one SSE frame
+            if event_name and data_lines:
+                data_str = "\n".join(data_lines)
+                try:
+                    data = json.loads(data_str)
+                except Exception:
+                    data = data_str
+                yield event_name, data
             event_name = None
+            data_lines = []
             continue
+
         if line.startswith("event:"):
-            event_name = line.split(":", 1)[1].strip()
-        elif line.startswith("data:"):
-            data_str = line.split(":", 1)[1].strip()
-            try:
-                data = json.loads(data_str)
-            except Exception:
-                data = {"raw": data_str}
-            yield event_name or "message", data
+            event_name = line[len("event:") :].strip()
+            continue
+
+        if line.startswith("data:"):
+            data_lines.append(line[len("data:") :].strip())
+            continue
 
 
-# -----------------------------
-# Verbatim dialog
-# -----------------------------
-@st.dialog("Verbatim source text")
-def show_verbatim_dialog(citation_id: str):
-    try:
-        r = api_get(f"/citations/{citation_id}", timeout=10.0)
-        if r.status_code != 200:
-            st.error(f"Could not fetch citation text. HTTP {r.status_code}")
-            st.stop()
-        payload = r.json()
-    except Exception as e:
-        st.error(f"Could not fetch citation text: {e}")
-        st.stop()
+def backend_settings_panel() -> Tuple[APIClient, Dict[str, Any]]:
+    with st.sidebar:
+        st.header("Settings")
 
-    # Header
-    st.caption(
-        f"Document: {payload.get('document', 'MML')} | Source: {payload.get('source_file', '-')}"
-    )
-    st.caption(
-        f"Heading: {payload.get('heading', '-')} | Location: {payload.get('location', '-')}"
-    )
+        backend_base = st.text_input("Backend base URL", value=st.session_state.get("backend_base", BACKEND_DEFAULT))
+        st.session_state["backend_base"] = backend_base
 
-    st.markdown("**Citation text (verbatim)**")
-    st.code(payload.get("verbatim", "").strip(), language="text")
+        mode = st.selectbox("Mode", options=["Chat"], index=0, key="mode")
 
-    with st.expander("Context (before)", expanded=False):
-        st.code(payload.get("context_before", "").strip(), language="text")
+        show_citations = st.checkbox("Show citations", value=st.session_state.get("show_citations", True), key="show_citations")
+        show_compliance = st.checkbox(
+            "Show compliance warnings",
+            value=st.session_state.get("show_compliance", True),
+            key="show_compliance",
+        )
 
-    with st.expander("Context (after)", expanded=False):
-        st.code(payload.get("context_after", "").strip(), language="text")
+        st.divider()
+        st.subheader("Backend status")
 
+        client = APIClient(base_url=backend_base)
+        status: Dict[str, Any] = {"ok": False}
 
-# -----------------------------
-# Page
-# -----------------------------
-st.set_page_config(page_title="SDD Legal AI System (PoC)", layout="wide")
-inject_css()
-ensure_session_state()
+        try:
+            health = client.get_health(timeout=5)
+            status = {"ok": True, "health": health}
+            st.success("OK")
+        except Exception:
+            st.error("NOT OK")
+
+        st.caption(f"Base: {backend_base}")
+        if st.button("Recheck"):
+            st.rerun()
+
+    return client, status
 
 
-# -----------------------------
-# Chat rendering helpers
-# -----------------------------
-def render_safe_chat_markdown(text: str) -> None:
-    """Render chat content as markdown with HTML-escaped text.
+def init_state():
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []  # list of dicts {role, content}
+    if "last_citations" not in st.session_state:
+        st.session_state["last_citations"] = []
+    if "last_warnings" not in st.session_state:
+        st.session_state["last_warnings"] = []
 
-    This keeps styling consistent while preventing HTML injection.
-    """
 
-    safe_text = html.escape(text)
-    markdown_ready = safe_text.replace("\n", "  \n")
-    st.markdown(markdown_ready)
+def render_messages():
+    for m in st.session_state["messages"]:
+        role = m.get("role", "")
+        content = m.get("content", "")
+        if role == "user":
+            st.markdown(f"🧑 **{content}**")
+        else:
+            st.markdown(f"🤖 {content}")
 
-st.title("SDD Legal AI System (PoC)")
-st.markdown(
-    '<div class="small-muted">Chat-style UI with grounded answers. FastAPI backend on port 8000.</div>',
-    unsafe_allow_html=True,
-)
 
-# Sidebar
-with st.sidebar:
-    st.header("Settings")
-    mode = st.selectbox("Mode", ["Chat", "Guided Workflow"], index=0)
-    show_citations = st.checkbox("Show citations", value=True)
-    show_warnings = st.checkbox("Show compliance warnings", value=True)
+def render_citations():
+    st.subheader("Citations")
+    cits = st.session_state.get("last_citations") or []
+    if not cits:
+        st.caption("No citations for the last answer.")
+        return
+    for c in cits:
+        st.write(c)
 
-    st.divider()
 
-    st.subheader("Backend status")
-    status = refresh_backend_status(api_client)
-    if status.reachable:
-        st.markdown('<span class="badge badge-ok">OK</span>', unsafe_allow_html=True)
-        st.caption(f"Base: {status.base_url}")
-    else:
-        st.markdown('<span class="badge badge-err">ERROR (not reachable)</span>', unsafe_allow_html=True)
-        st.caption(f"Tried: {', '.join(status.attempted) or 'None'}")
-        if status.message:
-            st.caption(f"Last error: {status.message}")
+def render_warnings():
+    warnings = st.session_state.get("last_warnings") or []
+    if not warnings:
+        return
+    st.subheader("Compliance warnings")
+    for w in warnings:
+        st.warning(w)
 
-    if st.button("Recheck", use_container_width=True):
-        refresh_backend_status(api_client, force=True)
+
+def main():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    init_state()
+
+    client, status = backend_settings_panel()
+
+    st.title(APP_TITLE)
+    st.caption("Chat-style UI with grounded answers. FastAPI backend on port 8000.")
+
+    st.header("Chat")
+    render_messages()
+
+    user_text = st.chat_input("Ask a question")
+    if user_text:
+        st.session_state["messages"].append({"role": "user", "content": user_text})
         st.rerun()
 
-# Session state
+    # If last message is user and not yet answered, call backend
+    if st.session_state["messages"] and st.session_state["messages"][-1]["role"] == "user":
+        # Show "Working..." placeholder message in UI
+        placeholder = st.empty()
+        placeholder.markdown("🤖 *Working...*")
+
+        payload = {
+            "messages": st.session_state["messages"],
+            "want_citations": bool(st.session_state.get("show_citations", True)),
+            "want_compliance_warnings": bool(st.session_state.get("show_compliance", True)),
+        }
+
+        answer_chunks: List[str] = []
+        st.session_state["last_citations"] = []
+        st.session_state["last_warnings"] = []
+
+        try:
+            # IMPORTANT CHANGE:
+            # Use timeout=None so Requests does not apply a read timeout while the backend is still working.
+            with client.post_stream("/chat/stream", payload, timeout=None) as resp:
+                for event, data in parse_sse_lines(resp):
+                    if event == "token":
+                        txt = data.get("t", "")
+                        if txt:
+                            answer_chunks.append(txt)
+                            placeholder.markdown("🤖 " + "".join(answer_chunks))
+                    elif event == "citations":
+                        st.session_state["last_citations"] = data.get("items", []) or []
+                    elif event == "warnings":
+                        st.session_state["last_warnings"] = data.get("items", []) or []
+                    elif event == "done":
+                        break
+
+            final_answer = "".join(answer_chunks).strip()
+            if not final_answer:
+                final_answer = "(No answer received.)"
+
+            st.session_state["messages"].append({"role": "assistant", "content": final_answer})
+            placeholder.empty()
+            st.rerun()
+
+        except Exception as e:
+            placeholder.empty()
+            st.error(f"Backend error: {e}")
+
+    if st.session_state.get("show_compliance", True):
+        render_warnings()
+
+    if st.session_state.get("show_citations", True):
+        render_citations()
 
 
-st.subheader("Chat")
-
-# Render history
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        render_safe_chat_markdown(m["content"])
-
-# Input
-prompt = st.chat_input("Ask a question")
-if prompt:
-    # Add user msg
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        render_safe_chat_markdown(prompt)
-
-    # Stream assistant
-    assistant_box = st.chat_message("assistant")
-    with assistant_box:
-        holder = st.empty()
-        running_text = ""
-        holder.markdown("_Working…_")
-
-    st.session_state.last_citations = []
-    st.session_state.last_warnings = []
-
-    req = {
-        "case_id": "default",
-        "messages": st.session_state.messages,
-        "mode": mode,
-        "want_citations": bool(show_citations),
-        "want_warnings": bool(show_warnings),
-    }
-
-    try:
-        with api_post_stream("/chat/stream", req, timeout=120.0) as resp:
-            if resp.status_code != 200:
-                raise RuntimeError(f"API error: HTTP {resp.status_code} - {resp.text}")
-
-            for event, data in parse_sse_lines(resp):
-                if event == "token":
-                    running_text += data.get("text", "")
-                    with assistant_box:
-                        render_safe_chat_markdown(running_text)
-                elif event == "citations":
-                    st.session_state.last_citations = data.get("items", [])
-                elif event == "warnings":
-                    st.session_state.last_warnings = data.get("items", [])
-                elif event == "done":
-                    pass
-
-        # Persist assistant message
-        st.session_state.messages.append({"role": "assistant", "content": running_text})
-
-    except Exception as e:
-        err_text = f"Backend error: {e}"
-        st.session_state.messages.append({"role": "assistant", "content": err_text})
-        with st.chat_message("assistant"):
-            st.error(err_text)
-
-# Citations panel (for last answer)
-if show_citations:
-    st.markdown("### Citations")
-    citations: List[Dict[str, Any]] = st.session_state.get("last_citations") or []
-    if not citations:
-        st.caption("No citations for the last answer.")
-    else:
-        for idx, c in enumerate(citations, start=1):
-            title = c.get("title") or "Untitled"
-            citation_id = c.get("citation_id") or c.get("source_id") or ""
-            meta = f"Source: {c.get('source_file','-')} | Heading: {c.get('heading','-')}"
-            snippet = (c.get("snippet") or "").strip()
-
-            cols = st.columns([6, 2], vertical_alignment="top")
-            with cols[0]:
-                st.markdown(
-                    f"""
-<div class="cite-card">
-  <div class="cite-title">{idx}. {title}</div>
-  <div class="cite-meta">{meta}</div>
-  <div class="cite-snippet">{snippet}</div>
-</div>
-""",
-                    unsafe_allow_html=True,
-                )
-            with cols[1]:
-                st.write("")
-                if st.button("View verbatim", key=f"vb_{idx}", use_container_width=True, type="secondary"):
-                    if citation_id:
-                        show_verbatim_dialog(citation_id)
-                    else:
-                        st.warning("Citation ID missing.")
-
-# Warnings panel (optional)
-if show_warnings:
-    warnings: List[Dict[str, Any]] = st.session_state.get("last_warnings") or []
-    if warnings:
-        st.markdown("### Compliance warnings")
-        for w in warnings:
-            st.warning(w.get("message", str(w)))
+if __name__ == "__main__":
+    main()
