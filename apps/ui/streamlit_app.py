@@ -148,10 +148,11 @@ def main():
         placeholder = st.empty()
         placeholder.markdown("🤖 *Working...*")
 
+        # --- Streaming request payload ---
         payload = {
             "messages": st.session_state["messages"],
             "want_citations": bool(st.session_state.get("show_citations", True)),
-            "want_compliance_warnings": bool(st.session_state.get("show_compliance", True)),
+            "want_warnings": bool(st.session_state.get("show_compliance", True)),
         }
 
         answer_chunks: List[str] = []
@@ -164,7 +165,7 @@ def main():
             with client.post_stream("/chat/stream", payload, timeout=None) as resp:
                 for event, data in parse_sse_lines(resp):
                     if event == "token":
-                        txt = data.get("t", "")
+                        txt = data.get("text") or data.get("t") or ""
                         if txt:
                             answer_chunks.append(txt)
                             placeholder.markdown("🤖 " + "".join(answer_chunks))
