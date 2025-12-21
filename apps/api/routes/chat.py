@@ -1,19 +1,23 @@
 import json
+import logging
 import time
-from typing import List, Literal, Optional, Dict, Any, Iterator
+from typing import Any, Dict, Iterator, List, Literal, Optional
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from apps.api.services.citation_store import citation_store
 from apps.api.services.intent import classify_legal_object
 from apps.api.services.retrieval import retrieve_citations
+from apps.api.services.router import route_domain
 from apps.api.services.synthesis import synthesize_answer_grounded
-from apps.api.services.citation_store import citation_store
 
 router = APIRouter()
 
 Role = Literal["system", "user", "assistant"]
+
+logger = logging.getLogger(__name__)
 
 
 class ChatMessage(BaseModel):
@@ -21,11 +25,11 @@ class ChatMessage(BaseModel):
     content: str
 
 
-class ChatRequest(BaseModel):
-    case_id: Optional[str] = "default"
-    messages: List[ChatMessage]
-    mode: Optional[str] = "Chat"
-    want_citations: Optional[bool] = True
+    class ChatRequest(BaseModel):
+        case_id: Optional[str] = "default"
+        messages: List[ChatMessage]
+        mode: Optional[str] = "Chat"
+        want_citations: Optional[bool] = True
     want_warnings: Optional[bool] = True
 
 
@@ -58,6 +62,67 @@ def chat_stream(req: ChatRequest):
             yield sse_event("done", {"ok": True})
             return
 
+        # --- Domain routing ---
+        domain = route_domain(question)
+        logger.info("chat_stream domain=%s", domain)
+
+        if domain == "SYSTEM_HELP":
+            yield sse_event(
+                "meta",
+                {
+                    "case_id": req.case_id,
+                    "mode": req.mode,
+                    "domain": domain,
+                },
+            )
+            system_help = (
+                "This looks like a system setup or runtime question. The system-help retrieval corpus "
+                "will be added next. For now, please specify what you are trying to start (API or UI) "
+                "and the error or command you ran."
+            )
+            for ch in system_help:
+                yield sse_event("token", {"text": ch})
+                time.sleep(0.001)
+
+            if req.want_citations:
+                yield sse_event("citations", {"items": []})
+
+            if req.want_warnings:
+                yield sse_event("warnings", {"items": []})
+            else:
+                yield sse_event("warnings", {"items": []})
+
+            yield sse_event("done", {"ok": True})
+            return
+
+        if domain == "CLARIFY":
+            yield sse_event(
+                "meta",
+                {
+                    "case_id": req.case_id,
+                    "mode": req.mode,
+                    "domain": domain,
+                },
+            )
+            clarify = (
+                "The request is too vague to answer safely. Please specify the legal context (Court of Inquiry, "
+                "Court-Martial, or general service matter) and what outcome you need (procedure, drafting, or references)."
+            )
+            for ch in clarify:
+                yield sse_event("token", {"text": ch})
+                time.sleep(0.001)
+
+            if req.want_citations:
+                yield sse_event("citations", {"items": []})
+
+            if req.want_warnings:
+                yield sse_event("warnings", {"items": []})
+            else:
+                yield sse_event("warnings", {"items": []})
+
+            yield sse_event("done", {"ok": True})
+            return
+
         # Intent gating (prevents COI vs Court-Martial drift)
         intent = classify_legal_object(question)
         yield sse_event(
@@ -65,6 +130,7 @@ def chat_stream(req: ChatRequest):
             {
                 "case_id": req.case_id,
                 "mode": req.mode,
+                "domain": domain,
                 "legal_object": intent.legal_object,
                 "intent_confidence": intent.confidence,
             },
