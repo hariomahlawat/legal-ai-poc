@@ -94,29 +94,49 @@ def chat_stream(req: ChatRequest):
             yield sse_event("done", {"ok": True})
             return
 
-        # 1) Retrieve evidence (RAG), constrained by legal object (soft)
-        retrieval_query = intent.normalized_query
-        if intent.legal_object == "Court of Inquiry":
-            # Expand acronym to improve recall and reduce Court-Martial drift.
-            if "court of inquiry" not in retrieval_query:
-                retrieval_query = retrieval_query.replace("coi", "court of inquiry")
-                retrieval_query = retrieval_query + " court of inquiry"
-        citations = retrieve_citations(
-            question=retrieval_query,
-            top_k=10,
-            legal_object=intent.legal_object,
-        )
+        # --- Retrieval and synthesis ---
+        try:
+            # 1) Retrieve evidence (RAG), constrained by legal object (soft)
+            retrieval_query = intent.normalized_query
+            if intent.legal_object == "Court of Inquiry":
+                # Expand acronym to improve recall and reduce Court-Martial drift.
+                if "court of inquiry" not in retrieval_query:
+                    retrieval_query = retrieval_query.replace("coi", "court of inquiry")
+                    retrieval_query = retrieval_query + " court of inquiry"
+            citations = retrieve_citations(
+                question=retrieval_query,
+                top_k=10,
+                legal_object=intent.legal_object,
+            )
 
-        # Register citations into store so UI can fetch verbatim by citation_id
-        for c in citations:
-            citation_store.upsert(c)
+            # Register citations into store so UI can fetch verbatim by citation_id
+            for c in citations:
+                citation_store.upsert(c)
 
-        # 2) Synthesize answer (grounded + validated)
-        result = synthesize_answer_grounded(
-            question=question,
-            citations=citations,
-            legal_object=intent.legal_object,
-        )
+            # 2) Synthesize answer (grounded + validated)
+            result = synthesize_answer_grounded(
+                question=question,
+                citations=citations,
+                legal_object=intent.legal_object,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard for unexpected failures
+            if req.want_warnings:
+                yield sse_event(
+                    "warnings",
+                    {
+                        "items": [
+                            {
+                                "code": "UNEXPECTED_ERROR",
+                                "message": f"Failed during retrieval/synthesis: {exc}",
+                            }
+                        ]
+                    },
+                )
+            else:
+                yield sse_event("warnings", {"items": []})
+
+            yield sse_event("done", {"ok": False})
+            return
 
         answer_text = (result.get("answer", "") or "").strip()
         warnings = result.get("warnings", []) or []
