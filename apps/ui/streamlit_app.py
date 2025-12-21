@@ -1,29 +1,31 @@
 import json
+import html
+from typing import Any, Dict, List
+
 import requests
 import streamlit as st
-from typing import Dict, Any, List, Optional
-import os
-import html
 
-def get_api_base() -> str:
-    # 1) Environment variable wins
-    env = os.getenv("API_BASE")
-    if env:
-        return env.rstrip("/")
+from apps.ui.client.api_client import ApiClient, BackendStatus
+from apps.ui.config import api_base_candidates
+from apps.ui.state.session_state import ensure_session_state
 
-    # 2) Use Streamlit secrets only if secrets exist
-    try:
-        # Accessing st.secrets triggers parsing; wrap to avoid crash if secrets.toml missing
-        val = st.secrets["API_BASE"]
-        if isinstance(val, str) and val.strip():
-            return val.strip().rstrip("/")
-    except Exception:
-        pass
 
-    # 3) Default
-    return "http://127.0.0.1:8000"
+# -----------------------------
+# Backend client helpers
+# -----------------------------
+def get_api_client() -> ApiClient:
+    candidates = api_base_candidates()
+    client: ApiClient | None = st.session_state.get("api_client")
+    if client:
+        client.update_candidates(candidates)
+    else:
+        client = ApiClient(candidates)
+        st.session_state.api_client = client
+    return client
 
-API_BASE = get_api_base()
+
+def refresh_backend_status(client: ApiClient, force: bool = False) -> BackendStatus:
+    return client.ensure_status(force_refresh=force)
 
 
 
@@ -88,19 +90,16 @@ button[kind="secondary"] { border-radius: 10px !important; }
 # -----------------------------
 # API helpers
 # -----------------------------
+api_client = get_api_client()
+
+
 def api_get(path: str, timeout: float = 4.0) -> requests.Response:
-    return requests.get(f"{API_BASE}{path}", timeout=timeout)
+    return api_client.get(path, timeout=timeout)
 
 
 def api_post_stream(path: str, payload: Dict[str, Any], timeout: float = 60.0):
     # SSE stream via POST
-    return requests.post(
-        f"{API_BASE}{path}",
-        json=payload,
-        headers={"Accept": "text/event-stream"},
-        stream=True,
-        timeout=timeout,
-    )
+    return api_client.post_stream(path, payload=payload, timeout=timeout)
 
 
 def parse_sse_lines(resp: requests.Response):
@@ -166,6 +165,7 @@ def show_verbatim_dialog(citation_id: str):
 # -----------------------------
 st.set_page_config(page_title="SDD Legal AI System (PoC)", layout="wide")
 inject_css()
+ensure_session_state()
 
 
 # -----------------------------
@@ -197,27 +197,21 @@ with st.sidebar:
     st.divider()
 
     st.subheader("Backend status")
-    try:
-        r = api_get("/health", timeout=2.0)
-        ok = r.status_code == 200
-    except Exception:
-        ok = False
-
-    if ok:
+    status = refresh_backend_status(api_client)
+    if status.reachable:
         st.markdown('<span class="badge badge-ok">OK</span>', unsafe_allow_html=True)
+        st.caption(f"Base: {status.base_url}")
     else:
         st.markdown('<span class="badge badge-err">ERROR (not reachable)</span>', unsafe_allow_html=True)
+        st.caption(f"Tried: {', '.join(status.attempted) or 'None'}")
+        if status.message:
+            st.caption(f"Last error: {status.message}")
 
     if st.button("Recheck", use_container_width=True):
+        refresh_backend_status(api_client, force=True)
         st.rerun()
 
 # Session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []  # list of dict(role, content)
-if "last_citations" not in st.session_state:
-    st.session_state.last_citations = []  # list of citation dicts
-if "last_warnings" not in st.session_state:
-    st.session_state.last_warnings = []
 
 
 st.subheader("Chat")
