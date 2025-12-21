@@ -25,11 +25,11 @@ class ChatMessage(BaseModel):
     content: str
 
 
-    class ChatRequest(BaseModel):
-        case_id: Optional[str] = "default"
-        messages: List[ChatMessage]
-        mode: Optional[str] = "Chat"
-        want_citations: Optional[bool] = True
+class ChatRequest(BaseModel):
+    case_id: Optional[str] = "default"
+    messages: List[ChatMessage]
+    mode: Optional[str] = "Chat"
+    want_citations: Optional[bool] = True
     want_warnings: Optional[bool] = True
 
 
