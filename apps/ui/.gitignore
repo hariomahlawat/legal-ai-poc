@@ -1,0 +1,24 @@
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Local environment files
+.env
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+
+# Archives
+*.zip
