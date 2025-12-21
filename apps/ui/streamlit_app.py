@@ -3,6 +3,7 @@ import requests
 import streamlit as st
 from typing import Dict, Any, List, Optional
 import os
+import html
 
 def get_api_base() -> str:
     # 1) Environment variable wins
@@ -43,13 +44,14 @@ h1, h2, h3 { letter-spacing: -0.01em; }
 
 /* Chat bubbles */
 [data-testid="stChatMessage"] { padding: 0.25rem 0; }
-.chat-card {
+[data-testid="stChatMessageContent"] > div[data-testid="stMarkdownContainer"] {
   border: 1px solid rgba(49,51,63,0.10);
   border-radius: 14px;
   padding: 14px 16px;
   background: white;
   box-shadow: 0 1px 2px rgba(0,0,0,0.04);
 }
+[data-testid="stChatMessageContent"] > div[data-testid="stMarkdownContainer"] p { margin-bottom: 0; }
 
 /* Citation cards */
 .cite-grid { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }
@@ -165,6 +167,20 @@ def show_verbatim_dialog(citation_id: str):
 st.set_page_config(page_title="SDD Legal AI System (PoC)", layout="wide")
 inject_css()
 
+
+# -----------------------------
+# Chat rendering helpers
+# -----------------------------
+def render_safe_chat_markdown(text: str) -> None:
+    """Render chat content as markdown with HTML-escaped text.
+
+    This keeps styling consistent while preventing HTML injection.
+    """
+
+    safe_text = html.escape(text)
+    markdown_ready = safe_text.replace("\n", "  \n")
+    st.markdown(markdown_ready)
+
 st.title("SDD Legal AI System (PoC)")
 st.markdown(
     '<div class="small-muted">Chat-style UI with grounded answers. FastAPI backend on port 8000.</div>',
@@ -209,7 +225,7 @@ st.subheader("Chat")
 # Render history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
-        st.markdown(f'<div class="chat-card">{m["content"]}</div>', unsafe_allow_html=True)
+        render_safe_chat_markdown(m["content"])
 
 # Input
 prompt = st.chat_input("Ask a question")
@@ -217,17 +233,14 @@ if prompt:
     # Add user msg
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
-        st.markdown(f'<div class="chat-card">{prompt}</div>', unsafe_allow_html=True)
+        render_safe_chat_markdown(prompt)
 
     # Stream assistant
     assistant_box = st.chat_message("assistant")
     with assistant_box:
         holder = st.empty()
         running_text = ""
-        holder.markdown(
-            '<div class="chat-card small-muted">Working…</div>',
-            unsafe_allow_html=True,
-        )
+        holder.markdown("_Working…_")
 
     st.session_state.last_citations = []
     st.session_state.last_warnings = []
@@ -249,10 +262,7 @@ if prompt:
                 if event == "token":
                     running_text += data.get("text", "")
                     with assistant_box:
-                        holder.markdown(
-                            f'<div class="chat-card">{running_text}</div>',
-                            unsafe_allow_html=True,
-                        )
+                        render_safe_chat_markdown(running_text)
                 elif event == "citations":
                     st.session_state.last_citations = data.get("items", [])
                 elif event == "warnings":
