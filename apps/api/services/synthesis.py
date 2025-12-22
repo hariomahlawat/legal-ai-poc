@@ -38,14 +38,29 @@ Keep language precise and professional. Avoid filler.
 """.strip()
 
 
-def _build_user_prompt(question: str, citations: List[Dict[str, Any]], legal_object: Optional[str]) -> str:
+def _extract_evidence_ids(evidence_block: str) -> set[str]:
+    ids: set[str] = set()
+    for line in evidence_block.splitlines():
+        match = re.match(r"^\[([^\[\]]+)\]", line.strip())
+        if match:
+            ids.add(match.group(1).strip())
+    return ids
+
+
+def _build_user_prompt(
+    question: str, citations: List[Dict[str, Any]], legal_object: Optional[str]
+) -> tuple[str, set[str]]:
     legal_line = f"Requested legal object: {legal_object}" if legal_object else "Requested legal object: (not specified)"
     evidence_block = build_evidence_pack(question, citations) if citations else "(no evidence retrieved)"
+    evidence_ids = _extract_evidence_ids(evidence_block) if citations else set()
 
     return (
-        f"{legal_line}\n\n"
-        f"Question:\n{question.strip()}\n\n"
-        f"EVIDENCE:\n{evidence_block}\n"
+        (
+            f"{legal_line}\n\n"
+            f"Question:\n{question.strip()}\n\n"
+            f"EVIDENCE:\n{evidence_block}\n"
+        ),
+        evidence_ids,
     )
 
 
@@ -205,10 +220,11 @@ def synthesize_answer_grounded(
             "warnings": [{"code": "NO_EVIDENCE", "message": "No evidence retrieved; returned a conservative template."}],
         }
 
+    # Build evidence pack and restrict allowed citations to those that actually appear in the pack
+    user_prompt, evidence_ids = _build_user_prompt(question, citations, legal_object)
     known_ids = {c.get("citation_id", "") for c in citations if c.get("citation_id")}
-    allowed_ids_line = "Allowed citation IDs: " + ", ".join(sorted(known_ids))
-
-    user_prompt = _build_user_prompt(question, citations, legal_object)
+    allowed_ids = evidence_ids if evidence_ids else known_ids
+    allowed_ids_line = "Allowed citation IDs: " + ", ".join(sorted(allowed_ids))
     evidence_length = len(user_prompt.split("EVIDENCE:\n", maxsplit=1)[-1])
     full_text_length = sum(len((c.get("verbatim", "") or "")) for c in citations)
     reduction_ratio = (evidence_length / full_text_length) if full_text_length else 0
@@ -225,7 +241,7 @@ def synthesize_answer_grounded(
     # Attempt 1
     try:
         answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
-        ok, issues, unknown_ids = _validate_answer(answer, known_ids)
+        ok, issues, unknown_ids = _validate_answer(answer, allowed_ids)
         if ok:
             return {"answer": answer, "warnings": warnings}
 
@@ -244,7 +260,7 @@ def synthesize_answer_grounded(
         )
 
         answer2 = _call_ollama_chat(corrective, user_prompt)
-        ok2, issues2, _unknown2 = _validate_answer(answer2, known_ids)
+        ok2, issues2, _unknown2 = _validate_answer(answer2, allowed_ids)
         if ok2:
             warnings.append({"code": "REPAIRED_OUTPUT", "message": "Model output required repair; a corrected answer was produced."})
             return {"answer": answer2, "warnings": warnings}
