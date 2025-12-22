@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional, Tuple
+import json
 import logging
 import os
 import re
@@ -9,6 +10,7 @@ import requests
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+TWO_PASS_ENABLED = os.getenv("TWO_PASS_ENABLED", "true").lower() != "false"
 
 from .evidence_packer import build_evidence_pack
 
@@ -35,6 +37,12 @@ Output format (strict):
   If facts are missing:
 
 Keep language precise and professional. Avoid filler.
+""".strip()
+
+_SYSTEM_PROMPT_PLANNER = """
+You are a planning assistant that produces JSON plans for legal drafting. Return JSON only with no additional prose.
+Each point must be tied to citation IDs provided. Do not invent citation IDs and do not include narrative.
+If evidence is insufficient for a point, add an assumption entry as 'Insufficient evidence: …' and cite the closest evidence ID.
 """.strip()
 
 
@@ -120,6 +128,57 @@ def _validate_answer(answer: str, known_ids: set[str]) -> Tuple[bool, List[Dict[
     return ok, issues, unknown_ids
 
 
+def _validate_plan(plan: Any, allowed_ids: set[str]) -> Tuple[bool, List[str]]:
+    """Validate planner output structure and citation usage."""
+    errors: List[str] = []
+
+    if not isinstance(plan, dict):
+        return False, ["Plan is not a JSON object."]
+
+    legal_object = plan.get("legal_object")
+    if legal_object is None or not isinstance(legal_object, str):
+        errors.append("Missing or invalid legal_object (string required).")
+
+    assumptions = plan.get("assumptions")
+    if assumptions is None or not isinstance(assumptions, list) or any(not isinstance(a, str) for a in assumptions):
+        errors.append("assumptions must be a list of strings (can be empty).")
+
+    steps = plan.get("steps")
+    if steps is None or not isinstance(steps, list):
+        errors.append("steps must be a list of step objects.")
+    else:
+        for idx, step in enumerate(steps):
+            if not isinstance(step, dict):
+                errors.append(f"Step {idx} is not an object.")
+                continue
+            if not isinstance(step.get("title"), str):
+                errors.append(f"Step {idx} missing title (string required).")
+            points = step.get("points")
+            if points is None or not isinstance(points, list):
+                errors.append(f"Step {idx} points must be a list.")
+                continue
+            for p_idx, point in enumerate(points):
+                if not isinstance(point, dict):
+                    errors.append(f"Point {p_idx} in step {idx} is not an object.")
+                    continue
+                if not isinstance(point.get("text"), str):
+                    errors.append(f"Point {p_idx} in step {idx} missing text (string required).")
+                citations = point.get("citations")
+                if citations is None or not isinstance(citations, list):
+                    errors.append(f"Point {p_idx} in step {idx} missing citations list.")
+                    continue
+                if not citations:
+                    errors.append(f"Point {p_idx} in step {idx} must include at least one citation.")
+                for c in citations:
+                    if not isinstance(c, str):
+                        errors.append(f"Point {p_idx} in step {idx} citation is not a string.")
+                        continue
+                    if c not in allowed_ids:
+                        errors.append(f"Point {p_idx} in step {idx} uses unknown citation ID: {c}.")
+
+    return len(errors) == 0, errors
+
+
 def _call_ollama_chat(system_prompt: str, user_prompt: str) -> str:
     payload = {
         "model": OLLAMA_MODEL,
@@ -135,6 +194,122 @@ def _call_ollama_chat(system_prompt: str, user_prompt: str) -> str:
     r.raise_for_status()
     data = r.json()
     return (data.get("message", {}) or {}).get("content", "").strip()
+
+
+# ----------------------------
+# Planner and writer utilities
+# ----------------------------
+def _build_planner_prompt(question: str, citations: List[Dict[str, Any]], legal_object: Optional[str], allowed_ids: set[str]) -> str:
+    legal_line = f"Requested legal object: {legal_object}" if legal_object else "Requested legal object: (not specified)"
+    evidence_block = build_evidence_pack(question, citations) if citations else "(no evidence retrieved)"
+    allowed_ids_line = ", ".join(sorted(allowed_ids))
+
+    schema_description = (
+        "Return JSON ONLY with keys: legal_object (string), assumptions (list of strings), steps (list of objects).\n"
+        "Each step: {title: string, points: list of {text: string, citations: list of citation_id strings}}.\n"
+        "Every point must include at least one citation from the allowed list."
+    )
+
+    instructions = (
+        "- Use only allowed citation IDs.\n"
+        "- Keep point texts concise and evidentiary.\n"
+        "- If evidence is insufficient for a point, place it under assumptions as 'Insufficient evidence: ...' and cite the closest evidence ID.\n"
+        "- Output JSON only, no prose before or after."
+    )
+
+    return (
+        f"{legal_line}\n\n"
+        f"Question:\n{question.strip()}\n\n"
+        f"Allowed citation IDs:\n{allowed_ids_line}\n\n"
+        f"EVIDENCE PACK (summarised):\n{evidence_block}\n\n"
+        f"Schema:\n{schema_description}\n\n"
+        f"Instructions:\n{instructions}"
+    )
+
+
+def _run_planner(
+    question: str,
+    citations: List[Dict[str, Any]],
+    legal_object: Optional[str],
+    allowed_ids: set[str],
+) -> Tuple[Optional[Dict[str, Any]], int, bool]:
+    """Run planner with a single retry on JSON/validation failure."""
+    planner_retry_count = 0
+    user_prompt = _build_planner_prompt(question, citations, legal_object, allowed_ids)
+
+    for attempt in range(2):
+        try:
+            raw_plan = _call_ollama_chat(_SYSTEM_PROMPT_PLANNER, user_prompt)
+            plan_obj = json.loads(raw_plan)
+            ok, errors = _validate_plan(plan_obj, allowed_ids)
+            if ok:
+                return plan_obj, planner_retry_count, True
+            planner_retry_count += 1
+            user_prompt = (
+                user_prompt
+                + "\n\nYou must return valid JSON only. Fix these issues: "
+                + "; ".join(errors)
+            )
+        except Exception:
+            planner_retry_count += 1
+            user_prompt = user_prompt + "\n\nYou must return valid JSON only with the required schema."
+            continue
+
+    return None, planner_retry_count, False
+
+
+def _run_writer(
+    question: str,
+    citations: List[Dict[str, Any]],
+    legal_object: Optional[str],
+    plan: Dict[str, Any],
+    known_ids: set[str],
+    allowed_ids_line: str,
+) -> Tuple[Optional[str], List[Dict[str, str]], int, bool]:
+    """Generate answer using validated plan and run validation with one retry."""
+    warnings: List[Dict[str, str]] = []
+    writer_retry_count = 0
+    plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
+    base_user_prompt = _build_user_prompt(question, citations, legal_object)
+    user_prompt = (
+        f"{base_user_prompt}\n\nValidated plan (JSON):\n{plan_json}\n\n"
+        "Follow the plan strictly. Use only allowed citation IDs. Ensure every bullet in Step-by-step ends with citations in brackets."
+    )
+
+    try:
+        answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
+        ok, issues, _unknown = _validate_answer(answer, known_ids)
+        if ok:
+            return answer, warnings, writer_retry_count, True
+
+        warnings.extend(issues)
+        corrective = (
+            _SYSTEM_PROMPT_BASE
+            + "\n\n"
+            + "You MUST fix the following issues in your answer:\n"
+            + "\n".join([f"- {i['code']}: {i['message']}" for i in issues])
+            + "\n\n"
+            + allowed_ids_line
+            + "\n"
+            + "Use the provided plan exactly. Ensure each procedural line ends with citation brackets.\n"
+        )
+        writer_retry_count += 1
+        answer2 = _call_ollama_chat(corrective, user_prompt)
+        ok2, issues2, _unknown2 = _validate_answer(answer2, known_ids)
+        if ok2:
+            warnings.append({"code": "REPAIRED_OUTPUT", "message": "Model output required repair; a corrected answer was produced."})
+            return answer2, warnings, writer_retry_count, True
+
+        warnings.extend(issues2)
+        return answer2, warnings, writer_retry_count, False
+    except Exception as e:
+        warnings.append(
+            {
+                "code": "LLM_UNAVAILABLE",
+                "message": f"Ollama/LLM unavailable or failed. Falling back to conservative template. Details: {e}",
+            }
+        )
+        return None, warnings, writer_retry_count, False
 
 
 def _fallback_template(question: str, citations: List[Dict[str, Any]], legal_object: Optional[str]) -> str:
@@ -185,6 +360,60 @@ def _fallback_template(question: str, citations: List[Dict[str, Any]], legal_obj
 
 
 # ----------------------------
+# Generation helpers
+# ----------------------------
+
+def _single_pass_answer(
+    question: str,
+    citations: List[Dict[str, Any]],
+    legal_object: Optional[str],
+    known_ids: set[str],
+    allowed_ids_line: str,
+    user_prompt: str,
+) -> Tuple[str, List[Dict[str, str]]]:
+    """Existing single-pass generation with validation and fallback."""
+    warnings: List[Dict[str, str]] = []
+
+    try:
+        answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
+        ok, issues, _unknown_ids = _validate_answer(answer, known_ids)
+        if ok:
+            return answer, warnings
+
+        warnings.extend(issues)
+
+        corrective = (
+            _SYSTEM_PROMPT_BASE
+            + "\n\n"
+            + "You MUST fix the following issues in your answer:\n"
+            + "\n".join([f"- {i['code']}: {i['message']}" for i in issues])
+            + "\n\n"
+            + allowed_ids_line
+            + "\n"
+            + "Important: Use ONLY these IDs. Each step/proposition line must end with brackets.\n"
+        )
+
+        answer2 = _call_ollama_chat(corrective, user_prompt)
+        ok2, issues2, _unknown2 = _validate_answer(answer2, known_ids)
+        if ok2:
+            warnings.append({"code": "REPAIRED_OUTPUT", "message": "Model output required repair; a corrected answer was produced."})
+            return answer2, warnings
+
+        warnings.extend(issues2)
+        warnings.append({"code": "FALLBACK_USED", "message": "Model output could not be validated. Falling back to conservative template."})
+        return _fallback_template(question, citations, legal_object), warnings
+
+    except Exception as e:
+        warnings.append(
+            {
+                "code": "LLM_UNAVAILABLE",
+                "message": f"Ollama/LLM unavailable or failed. Falling back to conservative template. Details: {e}",
+            }
+        )
+        return _fallback_template(question, citations, legal_object), warnings
+
+
+# ----------------------------
 # Answer synthesis pipeline
 # ----------------------------
 
@@ -222,42 +451,58 @@ def synthesize_answer_grounded(
         },
     )
 
-    # Attempt 1
-    try:
-        answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
-        ok, issues, unknown_ids = _validate_answer(answer, known_ids)
-        if ok:
-            return {"answer": answer, "warnings": warnings}
+    logger.info("two_pass_config", extra={"two_pass_enabled": TWO_PASS_ENABLED})
 
-        warnings.extend(issues)
-
-        # Attempt 2: corrective prompt
-        corrective = (
-            _SYSTEM_PROMPT_BASE
-            + "\n\n"
-            + "You MUST fix the following issues in your answer:\n"
-            + "\n".join([f"- {i['code']}: {i['message']}" for i in issues])
-            + "\n\n"
-            + allowed_ids_line
-            + "\n"
-            + "Important: Use ONLY these IDs. Each step/proposition line must end with brackets.\n"
+    if TWO_PASS_ENABLED:
+        plan, planner_retry_count, planner_success = _run_planner(question, citations, legal_object, known_ids)
+        logger.info(
+            "planner_result",
+            extra={
+                "two_pass_enabled": TWO_PASS_ENABLED,
+                "planner_success": planner_success,
+                "planner_retry_count": planner_retry_count,
+            },
         )
 
-        answer2 = _call_ollama_chat(corrective, user_prompt)
-        ok2, issues2, _unknown2 = _validate_answer(answer2, known_ids)
-        if ok2:
-            warnings.append({"code": "REPAIRED_OUTPUT", "message": "Model output required repair; a corrected answer was produced."})
-            return {"answer": answer2, "warnings": warnings}
+        if plan:
+            plan_steps = plan.get("steps", []) if isinstance(plan.get("steps"), list) else []
+            plan_point_count = sum(len(step.get("points", [])) for step in plan_steps if isinstance(step, dict))
+            logger.info(
+                "plan_stats",
+                extra={"plan_step_count": len(plan_steps), "plan_point_count": plan_point_count},
+            )
 
-        warnings.extend(issues2)
-        warnings.append({"code": "FALLBACK_USED", "message": "Model output could not be validated. Falling back to conservative template."})
-        return {"answer": _fallback_template(question, citations, legal_object), "warnings": warnings}
+            answer, writer_warnings, writer_retry_count, writer_success = _run_writer(
+                question,
+                citations,
+                legal_object,
+                plan,
+                known_ids,
+                allowed_ids_line,
+            )
+            warnings.extend(writer_warnings)
+            logger.info(
+                "writer_result",
+                extra={
+                    "writer_success": writer_success,
+                    "writer_retry_count": writer_retry_count,
+                    "plan_step_count": len(plan_steps),
+                    "plan_point_count": plan_point_count,
+                },
+            )
 
-    except Exception as e:
-        warnings.append(
-            {
-                "code": "LLM_UNAVAILABLE",
-                "message": f"Ollama/LLM unavailable or failed. Falling back to conservative template. Details: {e}",
-            }
-        )
-        return {"answer": _fallback_template(question, citations, legal_object), "warnings": warnings}
+            if writer_success and answer:
+                return {"answer": answer, "warnings": warnings}
+
+            warnings.append({"code": "FALLBACK_USED", "message": "Writer generation failed validation; falling back to single-pass generation."})
+
+    answer, single_pass_warnings = _single_pass_answer(
+        question,
+        citations,
+        legal_object,
+        known_ids,
+        allowed_ids_line,
+        user_prompt,
+    )
+    warnings.extend(single_pass_warnings)
+    return {"answer": answer, "warnings": warnings}
