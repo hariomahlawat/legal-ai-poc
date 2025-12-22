@@ -1,10 +1,16 @@
 import json
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import streamlit as st
+
+# === Path Setup ===
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from apps.ui.client.api_client import APIClient
 
