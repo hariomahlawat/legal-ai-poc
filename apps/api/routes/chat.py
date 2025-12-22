@@ -23,9 +23,6 @@ Role = Literal["system", "user", "assistant"]
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: Role
     content: str

@@ -101,26 +101,6 @@ def verify_grounding(
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     """
     Verifies that each bullet under 'Step-by-step procedure' is supported by the cited evidence.
-
-    Returns:
-      - ok: bool (True if all checked bullets supported)
-      - failures: list of dicts:
-          {
-            "bullet_index": int,
-            "bullet_text": str,
-            "claim_text": str,
-            "citation_ids": list[str],
-            "support": {
-              "best_id": str | None,
-              "overlap": int,
-              "matched_tokens": list[str]
-            }
-          }
-      - metrics (optional when return_metrics=True):
-          {
-            "bullets_checked": int,
-            "best_overlaps": list[int],
-          }
     """
 
     bullets = extract_step_bullets(answer)
@@ -171,7 +151,10 @@ def verify_grounding(
             continue
 
         for citation_id in citation_ids:
-            evidence_text = citation_map.get(citation_id, {}).get("text", "")
+            # Retrieval citations provide 'verbatim' (and do not always set 'text').
+            # Treat 'text' as an optional normalized field.
+            citation = citation_map.get(citation_id, {})
+            evidence_text = citation.get("text") or citation.get("verbatim") or ""
             evidence_tokens = set(_tokenize(evidence_text))
             overlap_tokens = claim_tokens.intersection(evidence_tokens)
             overlap = len(overlap_tokens)
