@@ -604,13 +604,13 @@ def _single_pass_answer(
                         "code": "GROUNDING_REPAIRED",
                         "message": "Answer required grounding repair; a corrected answer was produced.",
                     }
-            )
-            return repaired_answer, warnings
+                )
+                return repaired_answer, warnings
 
-        patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids, citations)
-        warnings.append(
-            {
-                "code": "GROUNDING_PATCHED",
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids, citations)
+            warnings.append(
+                {
+                    "code": "GROUNDING_PATCHED",
                     "message": "Unsupported bullets were replaced due to insufficient evidence.",
                 }
             )
