@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional, Tuple
+import logging
 import os
 import re
 import requests
@@ -9,7 +10,14 @@ import requests
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
+from .evidence_packer import build_evidence_pack
 
+logger = logging.getLogger(__name__)
+
+
+# ----------------------------
+# Prompts and templates
+# ----------------------------
 _SYSTEM_PROMPT_BASE = """
 You are a legal drafting assistant for a military legal research system.
 
@@ -32,18 +40,7 @@ Keep language precise and professional. Avoid filler.
 
 def _build_user_prompt(question: str, citations: List[Dict[str, Any]], legal_object: Optional[str]) -> str:
     legal_line = f"Requested legal object: {legal_object}" if legal_object else "Requested legal object: (not specified)"
-    ev_lines: List[str] = []
-    for c in citations:
-        cid = c.get("citation_id", "")
-        title = c.get("title", "MML")
-        src = c.get("source_file", "")
-        heading = c.get("heading", "")
-        verbatim = (c.get("verbatim", "") or "").strip()
-        ev_lines.append(
-            f"[{cid}] {title}\nSource: {src}\nHeading: {heading}\nVerbatim:\n{verbatim}\n"
-        )
-
-    evidence_block = "\n---\n".join(ev_lines) if ev_lines else "(no evidence retrieved)"
+    evidence_block = build_evidence_pack(question, citations) if citations else "(no evidence retrieved)"
 
     return (
         f"{legal_line}\n\n"
@@ -55,6 +52,9 @@ def _build_user_prompt(question: str, citations: List[Dict[str, Any]], legal_obj
 _CITATION_BRACKET_RE = re.compile(r"\[([^\[\]]+)\]")
 
 
+# ----------------------------
+# Validation utilities
+# ----------------------------
 def _validate_answer(answer: str, known_ids: set[str]) -> Tuple[bool, List[Dict[str, str]], List[str]]:
     """
     Returns:
@@ -184,6 +184,10 @@ def _fallback_template(question: str, citations: List[Dict[str, Any]], legal_obj
     )
 
 
+# ----------------------------
+# Answer synthesis pipeline
+# ----------------------------
+
 def synthesize_answer_grounded(
     question: str,
     citations: List[Dict[str, Any]],
@@ -205,6 +209,18 @@ def synthesize_answer_grounded(
     allowed_ids_line = "Allowed citation IDs: " + ", ".join(sorted(known_ids))
 
     user_prompt = _build_user_prompt(question, citations, legal_object)
+    evidence_length = len(user_prompt.split("EVIDENCE:\n", maxsplit=1)[-1])
+    full_text_length = sum(len((c.get("verbatim", "") or "")) for c in citations)
+    reduction_ratio = (evidence_length / full_text_length) if full_text_length else 0
+    logger.info(
+        "evidence_pack_built",
+        extra={
+            "citation_count": len(citations),
+            "evidence_length": evidence_length,
+            "full_text_length": full_text_length,
+            "reduction_ratio": round(reduction_ratio, 4) if reduction_ratio else 0,
+        },
+    )
 
     # Attempt 1
     try:
