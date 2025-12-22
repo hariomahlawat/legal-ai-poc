@@ -44,6 +44,13 @@ class CitationStore:
             self._data.popitem(last=False)
 
     def upsert(self, citation: Dict[str, Any]) -> None:
+        """
+        Store the full citation payload without dropping any keys.
+
+        A shallow copy is kept to avoid external mutation while retaining
+        the complete metadata received during retrieval.
+        """
+
         cid = citation.get("citation_id")
         if not cid:
             return
@@ -56,7 +63,7 @@ class CitationStore:
 
             # === Upsert ===
             self._data.pop(key, None)
-            self._data[key] = (now, citation)
+            self._data[key] = (now, dict(citation))
             self._data.move_to_end(key)
 
             # === Capacity Enforcement ===

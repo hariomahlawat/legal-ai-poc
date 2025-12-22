@@ -41,6 +41,12 @@ class APIClient:
         r.raise_for_status()
         return r.json()
 
+    def get_citation(self, citation_id: str, timeout: TimeoutType = 10) -> Dict[str, Any]:
+        url = self._url(f"/citations/{citation_id}")
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+
     def post_stream(
         self,
         path: str,
