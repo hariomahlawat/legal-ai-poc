@@ -12,10 +12,19 @@ OLLAMA_URL = os.getenv("OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL", "http://127
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 TWO_PASS_ENABLED = os.getenv("TWO_PASS_ENABLED", "true").lower() != "false"
 
+from .citation_store import citation_store
+from .claim_retry import build_claim_queries
 from .evidence_packer import build_evidence_pack
 from .grounding_verify import verify_grounding
+from .retrieval import retrieve_citations_multi
 
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------
+# Configuration
+# ----------------------------
+MAX_CITATIONS_FOR_REPAIR = 18
 
 
 # ----------------------------
@@ -207,6 +216,125 @@ def _log_grounding_result(
             ],
         },
     )
+
+
+# ----------------------------
+# Claim-level retrieval retry helpers
+# ----------------------------
+def _merge_and_dedupe_citations(
+    original: List[Dict[str, Any]], extras: List[Dict[str, Any]], max_total: int = MAX_CITATIONS_FOR_REPAIR
+) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    merged: List[Dict[str, Any]] = []
+
+    for group in (original, extras):
+        for citation in group:
+            cid = citation.get("citation_id")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            merged.append(citation)
+
+    return merged[:max_total]
+
+
+def _record_citations(citations: List[Dict[str, Any]]) -> None:
+    for citation in citations:
+        citation_store.upsert(citation)
+
+
+def _claim_retry_repair(
+    question: str,
+    legal_object: Optional[str],
+    plan: Optional[Dict[str, Any]],
+    base_answer: str,
+    citations: List[Dict[str, Any]],
+    failures: List[Dict[str, Any]],
+    telemetry: Dict[str, Any],
+) -> Tuple[str, bool, List[Dict[str, Any]], List[Dict[str, str]], List[Dict[str, Any]], bool]:
+    if telemetry.get("claim_retry_completed"):
+        return base_answer, False, failures, [], citations, False
+
+    telemetry["grounding_failures_initial_count"] = len(failures)
+
+    claim_packs = build_claim_queries(question, legal_object, failures)
+    telemetry["claim_retry_claims_selected"] = len(claim_packs)
+    telemetry["claim_retry_used"] = bool(claim_packs)
+
+    extras: List[Dict[str, Any]] = []
+    for pack in claim_packs:
+        extras.extend(
+            retrieve_citations_multi(
+                questions=pack.get("queries", []),
+                top_k=6,
+                legal_object=legal_object,
+            )
+        )
+
+    merged_citations = _merge_and_dedupe_citations(citations, extras, MAX_CITATIONS_FOR_REPAIR)
+    original_ids = {c.get("citation_id") for c in citations if c.get("citation_id")}
+    extra_ids = {c.get("citation_id") for c in merged_citations if c.get("citation_id") not in original_ids}
+    telemetry["claim_retry_extra_citations"] = len([cid for cid in extra_ids if cid])
+    telemetry["retrieval_retry_count"] = 1 if claim_packs else 0
+
+    _record_citations(merged_citations)
+
+    if not claim_packs:
+        telemetry["grounding_failures_after_retry_count"] = len(failures)
+        telemetry["claim_retry_completed"] = True
+        return base_answer, False, failures, [], merged_citations, False
+
+    plan_block = ""
+    if plan:
+        plan_block = f"Validated plan (JSON):\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"
+
+    failures_desc = []
+    for failure in claim_packs:
+        failures_desc.append(
+            "- Bullet {idx}: '{claim}'".format(
+                idx=failure.get("bullet_index"),
+                claim=failure.get("claim_text", ""),
+            )
+        )
+
+    corrective_instruction = (
+        "Grounding failures detected in Step-by-step procedure. Edit only these bullets; do not change unrelated bullets. "
+        "Use the merged evidence below. If the evidence remains insufficient, replace with: "
+        "'Insufficient evidence in the provided corpus to state this step precisely.' and cite the closest relevant citation ID."
+    )
+
+    user_prompt = (
+        f"{_build_user_prompt(question, merged_citations, legal_object)}\n\n"
+        f"{plan_block}"
+        f"Bullets to repair:\n{chr(10).join(failures_desc)}\n\n"
+        f"{corrective_instruction}"
+    )
+
+    merged_known_ids = {c.get("citation_id", "") for c in merged_citations if c.get("citation_id")}
+    repaired_answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
+    ok_format, issues, _unknown = _validate_answer(repaired_answer, merged_known_ids)
+    repair_failures = failures
+    grounding_ok = False
+
+    if ok_format:
+        grounding_ok, repair_failures = verify_grounding(repaired_answer, merged_citations)
+
+    telemetry["grounding_failures_after_retry_count"] = len(repair_failures)
+
+    logger.info(
+        "claim_retry_result",
+        extra={
+            "repair_mode": "claim_retry",
+            "grounding_failures_initial_count": len(failures),
+            "claim_retry_claims_selected": len(claim_packs),
+            "claim_retry_total_extra_citations": telemetry.get("claim_retry_extra_citations", 0),
+            "grounding_failures_after_retry_count": len(repair_failures),
+        },
+    )
+
+    _log_grounding_result(grounding_ok, repair_failures, repair_attempted=True, repair_success=grounding_ok and ok_format)
+    telemetry["claim_retry_completed"] = True
+    return repaired_answer, (ok_format and grounding_ok), repair_failures, issues, merged_citations, True
 
 
 def _patch_unsupported_bullets(
@@ -406,7 +534,8 @@ def _run_writer(
     plan: Dict[str, Any],
     known_ids: set[str],
     allowed_ids_line: str,
-) -> Tuple[Optional[str], List[Dict[str, str]], int, bool]:
+    telemetry: Dict[str, Any],
+) -> Tuple[Optional[str], List[Dict[str, str]], int, bool, List[Dict[str, Any]]]:
     """Generate answer using validated plan and run validation with one retry."""
     warnings: List[Dict[str, str]] = []
     writer_retry_count = 0
@@ -417,6 +546,16 @@ def _run_writer(
         "Follow the plan strictly. Use only allowed citation IDs. Ensure every bullet in Step-by-step ends with citations in brackets."
     )
 
+    telemetry.setdefault("retrieval_retry_count", 0)
+    telemetry.setdefault("claim_retry_used", False)
+    telemetry.setdefault("claim_retry_extra_citations", 0)
+    telemetry.setdefault("grounding_failures_initial_count", 0)
+    telemetry.setdefault("grounding_failures_after_retry_count", 0)
+    telemetry.setdefault("claim_retry_completed", False)
+    telemetry.setdefault("claim_retry_claims_selected", 0)
+    telemetry.setdefault("claim_retry_completed", False)
+    telemetry.setdefault("claim_retry_claims_selected", 0)
+
     try:
         answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
         ok, issues, _unknown = _validate_answer(answer, known_ids)
@@ -424,17 +563,21 @@ def _run_writer(
             grounding_ok, failures = verify_grounding(answer, citations)
             _log_grounding_result(grounding_ok, failures)
             if grounding_ok:
-                return answer, warnings, writer_retry_count, True
+                return answer, warnings, writer_retry_count, True, citations
 
-            repaired_answer, repair_success, repair_failures, repair_issues = _attempt_grounding_repair(
+            repaired_answer, repair_success, repair_failures, repair_issues, merged_citations, used_retry = _claim_retry_repair(
                 question,
-                citations,
                 legal_object,
                 plan,
-                known_ids,
+                answer,
+                citations,
                 failures,
+                telemetry,
             )
             warnings.extend(repair_issues)
+            if used_retry:
+                telemetry["claim_retry_used"] = True
+            merged_known_ids = {c.get("citation_id", "") for c in merged_citations if c.get("citation_id")}
             if repair_success:
                 warnings.append(
                     {
@@ -442,16 +585,16 @@ def _run_writer(
                         "message": "Answer required grounding repair; a corrected answer was produced.",
                     }
                 )
-                return repaired_answer, warnings, writer_retry_count, True
+                return repaired_answer, warnings, writer_retry_count, True, merged_citations
 
-            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids, citations)
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, merged_known_ids, merged_citations)
             warnings.append(
                 {
                     "code": "GROUNDING_PATCHED",
                     "message": "Unsupported bullets were replaced due to insufficient evidence.",
                 }
             )
-            return patched_answer, warnings, writer_retry_count, True
+            return patched_answer, warnings, writer_retry_count, True, merged_citations
 
         warnings.extend(issues)
         corrective = (
@@ -477,17 +620,21 @@ def _run_writer(
                         "message": "Model output required repair; a corrected answer was produced.",
                     }
                 )
-                return answer2, warnings, writer_retry_count, True
+                return answer2, warnings, writer_retry_count, True, citations
 
-            repaired_answer, repair_success, repair_failures, repair_issues = _attempt_grounding_repair(
+            repaired_answer, repair_success, repair_failures, repair_issues, merged_citations, used_retry = _claim_retry_repair(
                 question,
-                citations,
                 legal_object,
                 plan,
-                known_ids,
+                answer2,
+                citations,
                 failures,
+                telemetry,
             )
             warnings.extend(repair_issues)
+            if used_retry:
+                telemetry["claim_retry_used"] = True
+            merged_known_ids = {c.get("citation_id", "") for c in merged_citations if c.get("citation_id")}
             if repair_success:
                 warnings.append(
                     {
@@ -495,19 +642,19 @@ def _run_writer(
                         "message": "Answer required grounding repair; a corrected answer was produced.",
                     }
                 )
-                return repaired_answer, warnings, writer_retry_count, True
+                return repaired_answer, warnings, writer_retry_count, True, merged_citations
 
-            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids, citations)
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, merged_known_ids, merged_citations)
             warnings.append(
                 {
                     "code": "GROUNDING_PATCHED",
                     "message": "Unsupported bullets were replaced due to insufficient evidence.",
                 }
             )
-            return patched_answer, warnings, writer_retry_count, True
+            return patched_answer, warnings, writer_retry_count, True, merged_citations
 
         warnings.extend(issues2)
-        return answer2, warnings, writer_retry_count, False
+        return answer2, warnings, writer_retry_count, False, citations
     except Exception as e:
         warnings.append(
             {
@@ -515,7 +662,7 @@ def _run_writer(
                 "message": f"Ollama/LLM unavailable or failed. Falling back to conservative template. Details: {e}",
             }
         )
-        return None, warnings, writer_retry_count, False
+        return None, warnings, writer_retry_count, False, citations
 
 
 def _fallback_template(question: str, citations: List[Dict[str, Any]], legal_object: Optional[str]) -> str:
@@ -576,9 +723,15 @@ def _single_pass_answer(
     known_ids: set[str],
     allowed_ids_line: str,
     user_prompt: str,
-) -> Tuple[str, List[Dict[str, str]]]:
+    telemetry: Dict[str, Any],
+) -> Tuple[str, List[Dict[str, str]], List[Dict[str, Any]]]:
     """Existing single-pass generation with validation and fallback."""
     warnings: List[Dict[str, str]] = []
+    telemetry.setdefault("retrieval_retry_count", 0)
+    telemetry.setdefault("claim_retry_used", False)
+    telemetry.setdefault("claim_retry_extra_citations", 0)
+    telemetry.setdefault("grounding_failures_initial_count", 0)
+    telemetry.setdefault("grounding_failures_after_retry_count", 0)
 
     try:
         answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
@@ -587,17 +740,21 @@ def _single_pass_answer(
             grounding_ok, failures = verify_grounding(answer, citations)
             _log_grounding_result(grounding_ok, failures)
             if grounding_ok:
-                return answer, warnings
+                return answer, warnings, citations
 
-            repaired_answer, repair_success, repair_failures, repair_issues = _attempt_grounding_repair(
+            repaired_answer, repair_success, repair_failures, repair_issues, merged_citations, used_retry = _claim_retry_repair(
                 question,
-                citations,
                 legal_object,
                 None,
-                known_ids,
+                answer,
+                citations,
                 failures,
+                telemetry,
             )
             warnings.extend(repair_issues)
+            if used_retry:
+                telemetry["claim_retry_used"] = True
+            merged_known_ids = {c.get("citation_id", "") for c in merged_citations if c.get("citation_id")}
             if repair_success:
                 warnings.append(
                     {
@@ -605,16 +762,16 @@ def _single_pass_answer(
                         "message": "Answer required grounding repair; a corrected answer was produced.",
                     }
                 )
-                return repaired_answer, warnings
+                return repaired_answer, warnings, merged_citations
 
-            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids, citations)
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, merged_known_ids, merged_citations)
             warnings.append(
                 {
                     "code": "GROUNDING_PATCHED",
                     "message": "Unsupported bullets were replaced due to insufficient evidence.",
                 }
             )
-            return patched_answer, warnings
+            return patched_answer, warnings, merged_citations
 
         warnings.extend(issues)
 
@@ -641,17 +798,21 @@ def _single_pass_answer(
                         "message": "Model output required repair; a corrected answer was produced.",
                     }
                 )
-                return answer2, warnings
+                return answer2, warnings, citations
 
-            repaired_answer, repair_success, repair_failures, repair_issues = _attempt_grounding_repair(
+            repaired_answer, repair_success, repair_failures, repair_issues, merged_citations, used_retry = _claim_retry_repair(
                 question,
-                citations,
                 legal_object,
                 None,
-                known_ids,
+                answer2,
+                citations,
                 failures,
+                telemetry,
             )
             warnings.extend(repair_issues)
+            if used_retry:
+                telemetry["claim_retry_used"] = True
+            merged_known_ids = {c.get("citation_id", "") for c in merged_citations if c.get("citation_id")}
             if repair_success:
                 warnings.append(
                     {
@@ -659,20 +820,20 @@ def _single_pass_answer(
                         "message": "Answer required grounding repair; a corrected answer was produced.",
                     }
                 )
-                return repaired_answer, warnings
+                return repaired_answer, warnings, merged_citations
 
-            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids, citations)
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, merged_known_ids, merged_citations)
             warnings.append(
                 {
                     "code": "GROUNDING_PATCHED",
                     "message": "Unsupported bullets were replaced due to insufficient evidence.",
                 }
             )
-            return patched_answer, warnings
+            return patched_answer, warnings, merged_citations
 
         warnings.extend(issues2)
         warnings.append({"code": "FALLBACK_USED", "message": "Model output could not be validated. Falling back to conservative template."})
-        return _fallback_template(question, citations, legal_object), warnings
+        return _fallback_template(question, citations, legal_object), warnings, citations
 
     except Exception as e:
         warnings.append(
@@ -681,7 +842,7 @@ def _single_pass_answer(
                 "message": f"Ollama/LLM unavailable or failed. Falling back to conservative template. Details: {e}",
             }
         )
-        return _fallback_template(question, citations, legal_object), warnings
+        return _fallback_template(question, citations, legal_object), warnings, citations
 
 
 # ----------------------------
@@ -698,11 +859,21 @@ def synthesize_answer_grounded(
     Retries once with a corrective prompt if citations or structure are invalid.
     """
     warnings: List[Dict[str, str]] = []
+    telemetry: Dict[str, Any] = {
+        "retrieval_retry_count": 0,
+        "claim_retry_used": False,
+        "claim_retry_extra_citations": 0,
+        "grounding_failures_initial_count": 0,
+        "grounding_failures_after_retry_count": 0,
+        "claim_retry_claims_selected": 0,
+        "claim_retry_completed": False,
+    }
 
     if not citations:
         return {
             "answer": _fallback_template(question, citations, legal_object),
             "warnings": [{"code": "NO_EVIDENCE", "message": "No evidence retrieved; returned a conservative template."}],
+            "telemetry": telemetry,
         }
 
     known_ids = {c.get("citation_id", "") for c in citations if c.get("citation_id")}
@@ -743,13 +914,14 @@ def synthesize_answer_grounded(
                 extra={"plan_step_count": len(plan_steps), "plan_point_count": plan_point_count},
             )
 
-            answer, writer_warnings, writer_retry_count, writer_success = _run_writer(
+            answer, writer_warnings, writer_retry_count, writer_success, used_citations = _run_writer(
                 question,
                 citations,
                 legal_object,
                 plan,
                 known_ids,
                 allowed_ids_line,
+                telemetry,
             )
             warnings.extend(writer_warnings)
             logger.info(
@@ -763,17 +935,18 @@ def synthesize_answer_grounded(
             )
 
             if writer_success and answer:
-                return {"answer": answer, "warnings": warnings}
+                return {"answer": answer, "warnings": warnings, "telemetry": telemetry, "citations": used_citations}
 
             warnings.append({"code": "FALLBACK_USED", "message": "Writer generation failed validation; falling back to single-pass generation."})
 
-    answer, single_pass_warnings = _single_pass_answer(
+    answer, single_pass_warnings, final_citations = _single_pass_answer(
         question,
         citations,
         legal_object,
         known_ids,
         allowed_ids_line,
         user_prompt,
+        telemetry,
     )
     warnings.extend(single_pass_warnings)
-    return {"answer": answer, "warnings": warnings}
+    return {"answer": answer, "warnings": warnings, "telemetry": telemetry, "citations": final_citations}

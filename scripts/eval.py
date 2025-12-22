@@ -190,6 +190,7 @@ def _evaluate_question(item: QuestionItem, mode: str) -> QuestionResult:
         if domain == "LEGAL":
             answer_payload = synthesize_answer_grounded(item.question, citations)
             answer = answer_payload.get("answer") if isinstance(answer_payload, dict) else answer_payload
+            telemetry = answer_payload.get("telemetry", {}) if isinstance(answer_payload, dict) else {}
             grounding_ok, grounding_failures, grounding_stats = verify_grounding(
                 answer,
                 citations,
@@ -200,6 +201,15 @@ def _evaluate_question(item: QuestionItem, mode: str) -> QuestionResult:
             grounding_failures_count = len(grounding_failures)
             avg_best_overlap = mean(best_overlaps) if best_overlaps else 0.0
             min_best_overlap = min(best_overlaps) if best_overlaps else 0
+            metrics.update(
+                {
+                    "retrieval_retry_count": telemetry.get("retrieval_retry_count", 0),
+                    "claim_retry_used": telemetry.get("claim_retry_used", False),
+                    "claim_retry_extra_citations": telemetry.get("claim_retry_extra_citations", 0),
+                    "grounding_failures_before": telemetry.get("grounding_failures_initial_count"),
+                    "grounding_failures_after": telemetry.get("grounding_failures_after_retry_count"),
+                }
+            )
         elif domain == "SYSTEM_HELP":
             answer = synthesize_repo_answer_grounded(item.question, citations)
             grounding_ok = True
