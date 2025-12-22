@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
+from requests.exceptions import ConnectTimeout, ReadTimeout, Timeout
 
 from apps.api.config import (
     OLLAMA_CONNECT_TIMEOUT_SECS,
@@ -53,20 +54,24 @@ def _prompt_char_length(messages: List[Dict[str, Any]]) -> int:
 
 def _mark_failure() -> None:
     """Record a connectivity failure to activate the cool-down window."""
-
     global _OLLAMA_HEALTHY, _OLLAMA_LAST_FAILURE
-
     _OLLAMA_HEALTHY = False
     _OLLAMA_LAST_FAILURE = time.monotonic()
 
 
+def _short_circuit_elapsed_secs() -> Optional[float]:
+    """Return seconds since last failure if currently unhealthy, else None."""
+    if _OLLAMA_HEALTHY is False and _OLLAMA_LAST_FAILURE is not None:
+        return time.monotonic() - _OLLAMA_LAST_FAILURE
+    return None
+
+
 def _should_short_circuit() -> bool:
     """Determine if we should skip calling Ollama due to recent failures."""
-
-    if _OLLAMA_HEALTHY is False and _OLLAMA_LAST_FAILURE is not None:
-        elapsed = time.monotonic() - _OLLAMA_LAST_FAILURE
-        return elapsed < OLLAMA_FAILURE_COOLDOWN_SECS
-    return False
+    elapsed = _short_circuit_elapsed_secs()
+    if elapsed is None:
+        return False
+    return elapsed < OLLAMA_FAILURE_COOLDOWN_SECS
 
 
 # ============================
@@ -75,7 +80,25 @@ def _should_short_circuit() -> bool:
 def ollama_chat(model: str, messages: List[Dict[str, Any]], options: Dict[str, Any], request_id: str) -> str:
     """Call Ollama chat endpoint with consistent timeouts and logging."""
 
+    # Circuit breaker: if we recently failed, skip hitting Ollama until cooldown ends.
     if _should_short_circuit():
+        elapsed = _short_circuit_elapsed_secs() or 0.0
+        msg = (
+            "ollama_short_circuit "
+            f"request_id={request_id} model={model} "
+            f"elapsed_since_failure_secs={round(elapsed, 3)} cooldown_secs={OLLAMA_FAILURE_COOLDOWN_SECS}"
+        )
+        # Log as a plain message (so it shows up even with basic formatters),
+        # and also attach structured fields via "extra".
+        logger.warning(
+            msg,
+            extra={
+                "request_id": request_id,
+                "model": model,
+                "elapsed_since_failure_secs": round(elapsed, 3),
+                "cooldown_secs": OLLAMA_FAILURE_COOLDOWN_SECS,
+            },
+        )
         raise OllamaConnectionError(
             "Recent Ollama failures detected; skipping request until cooldown expires."
         )
@@ -104,11 +127,27 @@ def ollama_chat(model: str, messages: List[Dict[str, Any]], options: Dict[str, A
             timeout=(OLLAMA_CONNECT_TIMEOUT_SECS, OLLAMA_READ_TIMEOUT_SECS),
         )
         resp.raise_for_status()
-    except requests.Timeout as exc:  # pragma: no cover - network
+
+    except Timeout as exc:  # pragma: no cover - network
         elapsed = time.monotonic() - start
         _mark_failure()
+
+        timeout_kind = "timeout"
+        if isinstance(exc, ConnectTimeout):
+            timeout_kind = "connect_timeout"
+        elif isinstance(exc, ReadTimeout):
+            timeout_kind = "read_timeout"
+
+        msg = (
+            "ollama_timeout "
+            f"kind={timeout_kind} request_id={request_id} model={model} "
+            f"elapsed_secs={round(elapsed, 3)} "
+            f"connect_timeout_secs={OLLAMA_CONNECT_TIMEOUT_SECS} read_timeout_secs={OLLAMA_READ_TIMEOUT_SECS} "
+            f"url={OLLAMA_URL} exc={exc!r}"
+        )
+
         logger.warning(
-            "ollama_timeout",
+            msg,
             extra={
                 "request_id": request_id,
                 "model": model,
@@ -116,30 +155,68 @@ def ollama_chat(model: str, messages: List[Dict[str, Any]], options: Dict[str, A
                 "num_predict": final_options.get("num_predict"),
                 "temperature": final_options.get("temperature"),
                 "elapsed_secs": round(elapsed, 3),
+                "timeout_kind": timeout_kind,
+                "timeout_connect_secs": OLLAMA_CONNECT_TIMEOUT_SECS,
                 "timeout_read_secs": OLLAMA_READ_TIMEOUT_SECS,
+                "url": OLLAMA_URL,
+                "exception": repr(exc),
             },
         )
-        raise OllamaTimeoutError(f"Ollama request timed out after {OLLAMA_READ_TIMEOUT_SECS}s") from exc
+
+        raise OllamaTimeoutError(
+            f"Ollama {timeout_kind} after {round(elapsed, 3)}s "
+            f"(connect={OLLAMA_CONNECT_TIMEOUT_SECS}s, read={OLLAMA_READ_TIMEOUT_SECS}s)"
+        ) from exc
+
     except requests.ConnectionError as exc:  # pragma: no cover - network
+        elapsed = time.monotonic() - start
         _mark_failure()
-        logger.error(
-            "ollama_connection_error",
-            extra={"request_id": request_id, "model": model, "prompt_chars": prompt_chars},
+
+        msg = (
+            "ollama_connection_error "
+            f"request_id={request_id} model={model} elapsed_secs={round(elapsed, 3)} "
+            f"url={OLLAMA_URL} exc={exc!r}"
         )
-        raise OllamaConnectionError(f"Unable to reach Ollama at {OLLAMA_URL}") from exc
-    except requests.RequestException as exc:  # pragma: no cover - network
-        _mark_failure()
+
         logger.error(
-            "ollama_response_error",
+            msg,
             extra={
                 "request_id": request_id,
                 "model": model,
                 "prompt_chars": prompt_chars,
-                "status_code": getattr(exc.response, "status_code", None),
+                "elapsed_secs": round(elapsed, 3),
+                "url": OLLAMA_URL,
+                "exception": repr(exc),
+            },
+        )
+        raise OllamaConnectionError(f"Unable to reach Ollama at {OLLAMA_URL}") from exc
+
+    except requests.RequestException as exc:  # pragma: no cover - network
+        elapsed = time.monotonic() - start
+        _mark_failure()
+
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        msg = (
+            "ollama_response_error "
+            f"request_id={request_id} model={model} elapsed_secs={round(elapsed, 3)} "
+            f"status_code={status_code} url={OLLAMA_URL} exc={exc!r}"
+        )
+
+        logger.error(
+            msg,
+            extra={
+                "request_id": request_id,
+                "model": model,
+                "prompt_chars": prompt_chars,
+                "elapsed_secs": round(elapsed, 3),
+                "status_code": status_code,
+                "url": OLLAMA_URL,
+                "exception": repr(exc),
             },
         )
         raise OllamaResponseError(f"Ollama request failed: {exc}") from exc
 
+    # Success path
     elapsed = time.monotonic() - start
     data = resp.json()
     content = (data.get("message", {}) or {}).get("content", "").strip()
@@ -149,8 +226,15 @@ def ollama_chat(model: str, messages: List[Dict[str, Any]], options: Dict[str, A
     _OLLAMA_HEALTHY = True
     _OLLAMA_LAST_FAILURE = None
 
+    msg = (
+        "ollama_chat_ok "
+        f"request_id={request_id} model={model} elapsed_secs={round(elapsed, 3)} "
+        f"prompt_chars={prompt_chars} num_predict={final_options.get('num_predict')} "
+        f"temperature={final_options.get('temperature')}"
+    )
+
     logger.info(
-        "ollama_chat",
+        msg,
         extra={
             "request_id": request_id,
             "model": model,
@@ -158,9 +242,10 @@ def ollama_chat(model: str, messages: List[Dict[str, Any]], options: Dict[str, A
             "num_predict": final_options.get("num_predict"),
             "temperature": final_options.get("temperature"),
             "elapsed_secs": round(elapsed, 3),
+            "timeout_connect_secs": OLLAMA_CONNECT_TIMEOUT_SECS,
             "timeout_read_secs": OLLAMA_READ_TIMEOUT_SECS,
+            "url": OLLAMA_URL,
         },
     )
 
     return content
-

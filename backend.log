@@ -1,4 +1,13 @@
-INFO:     Started server process [15908]
+INFO:     Started server process [36372]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:49672 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57752 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57753 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57754 - "POST /chat/stream HTTP/1.1" 200 OK
+C:\legal-ai-poc\.venv\Lib\site-packages\transformers\utils\hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+No sentence-transformers model found with name sentence-transformers/all-MiniLM-L6-v2. Creating a new one with mean pooling.
+rerank.model_load_failed model=cross-encoder/ms-marco-MiniLM-L-6-v2 error=We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.
+Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'.
