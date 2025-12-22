@@ -11,6 +11,9 @@ import requests
 OLLAMA_URL = os.getenv("OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 TWO_PASS_ENABLED = os.getenv("TWO_PASS_ENABLED", "true").lower() != "false"
+OLLAMA_HEALTH_TIMEOUT = float(os.getenv("OLLAMA_HEALTH_TIMEOUT", "5"))
+OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "45"))
+_OLLAMA_HEALTHY: Optional[bool] = None
 
 from .citation_store import citation_store
 from .claim_retry import build_claim_queries
@@ -68,6 +71,31 @@ def _build_user_prompt(question: str, citations: List[Dict[str, Any]], legal_obj
 
 
 _CITATION_BRACKET_RE = re.compile(r"\[([^\[\]]+)\]")
+
+
+# ----------------------------
+# LLM connectivity helpers
+# ----------------------------
+def _ollama_available() -> bool:
+    """Check if Ollama endpoint is reachable before attempting generation."""
+
+    global _OLLAMA_HEALTHY
+
+    if _OLLAMA_HEALTHY is True:
+        return True
+
+    try:
+        resp = requests.get(
+            f"{OLLAMA_URL}/api/tags",
+            timeout=(OLLAMA_HEALTH_TIMEOUT, OLLAMA_HEALTH_TIMEOUT),
+        )
+        resp.raise_for_status()
+        _OLLAMA_HEALTHY = True
+        return True
+    except Exception as exc:  # pragma: no cover - connectivity dependent
+        logger.warning("Ollama health check failed: %s", exc)
+        _OLLAMA_HEALTHY = False
+        return False
 
 
 # ----------------------------
@@ -449,6 +477,11 @@ def _attempt_grounding_repair(
 
 
 def _call_ollama_chat(system_prompt: str, user_prompt: str) -> str:
+    if not _ollama_available():
+        raise RuntimeError(
+            f"Ollama not reachable at {OLLAMA_URL}. Set OLLAMA_URL or start the service."
+        )
+
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
@@ -459,7 +492,11 @@ def _call_ollama_chat(system_prompt: str, user_prompt: str) -> str:
         "options": {"temperature": 0.2},
     }
 
-    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=90)
+    r = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json=payload,
+        timeout=(OLLAMA_HEALTH_TIMEOUT, OLLAMA_READ_TIMEOUT),
+    )
     r.raise_for_status()
     data = r.json()
     return (data.get("message", {}) or {}).get("content", "").strip()
