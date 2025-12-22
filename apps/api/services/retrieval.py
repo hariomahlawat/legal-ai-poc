@@ -195,6 +195,9 @@ def _normalize_scores(pairs: List[Tuple[int, float]]) -> Dict[int, float]:
     return out
 
 
+# ----------------------------
+# Single-query hybrid retrieval
+# ----------------------------
 def retrieve_citations(
     question: str,
     top_k: int = 8,
@@ -325,6 +328,139 @@ def retrieve_citations(
                 "context_before": (before or "").strip(),
                 "context_after": (after or "").strip(),
                 "snippet": snippet,
+            }
+        )
+
+    return out
+
+
+# ----------------------------
+# Multi-query hybrid retrieval
+# ----------------------------
+def retrieve_citations_multi(
+    questions: List[str],
+    top_k: int = 8,
+    legal_object: Optional[str] = None,
+    lexical_k: int = 60,
+    semantic_k: int = 60,
+) -> List[Dict[str, Any]]:
+    """
+    Multi-query hybrid retrieval with per-query fusion and cross-query max pooling.
+    """
+    _ensure_loaded()
+
+    if not questions:
+        return []
+
+    # If BM25 is unavailable, we cannot retrieve reliably
+    if _STATE.bm25 is None or not _STATE.bm25_meta:
+        return []
+
+    normalized_questions = [q.strip() for q in questions if (q or "").strip()]
+    if not normalized_questions:
+        return []
+
+    final_scores: Dict[int, float] = {}
+    hit_queries: Dict[int, List[int]] = {}
+
+    for q_idx, q in enumerate(normalized_questions):
+        # 1) Lexical retrieval (BM25)
+        q_tokens = _bm25_tokenize(q)
+        try:
+            bm25_scores = _STATE.bm25.get_scores(q_tokens)  # type: ignore[attr-defined]
+            bm25_pairs = sorted(enumerate(bm25_scores), key=lambda x: x[1], reverse=True)[:lexical_k]
+        except Exception:
+            bm25_pairs = []
+
+        bm25_norm = _normalize_scores([(i, float(s)) for i, s in bm25_pairs])
+
+        # 2) Semantic retrieval (FAISS), optional
+        faiss_norm: Dict[int, float] = {}
+        if _STATE.faiss_index is not None and _STATE.embed_model is not None and _STATE.faiss_meta:
+            try:
+                import numpy as np  # type: ignore
+
+                q_vec = _STATE.embed_model.encode([q], normalize_embeddings=True)  # type: ignore[attr-defined]
+                q_vec = np.asarray(q_vec, dtype="float32")
+                D, I = _STATE.faiss_index.search(q_vec, semantic_k)  # type: ignore[union-attr]
+                faiss_pairs = [(int(i), float(d)) for i, d in zip(I[0].tolist(), D[0].tolist()) if int(i) >= 0]
+                faiss_norm = _normalize_scores(faiss_pairs)
+            except Exception:
+                faiss_norm = {}
+
+        # 3) Candidate union for this query
+        candidate_is = set(bm25_norm.keys()) | set(faiss_norm.keys())
+        if not candidate_is:
+            continue
+
+        for i in candidate_is:
+            if i < 0 or i >= len(_STATE.bm25_meta):
+                continue
+            ch = _STATE.bm25_meta[i]
+
+            # Drop ultra-short chunks that are usually headings or fragments
+            text_len = len((ch.text or "").strip())
+            if text_len < 120:
+                continue
+
+            s_b = bm25_norm.get(i, 0.0)
+            s_f = faiss_norm.get(i, 0.0)
+
+            fused_score = max(s_b, s_f)
+
+            boost = 1.0 + _soft_intent_boost(legal_object, ch)
+            fused_score *= boost
+
+            prev_score = final_scores.get(i, 0.0)
+            if fused_score > prev_score:
+                final_scores[i] = float(fused_score)
+
+            if fused_score > 0.0:
+                hit_queries.setdefault(i, []).append(q_idx)
+
+    if not final_scores:
+        return []
+
+    # Sort by fused score
+    scored = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
+    top_indices = [i for i, _ in scored[: max(top_k, 1)]]
+
+    out: List[Dict[str, Any]] = []
+    for i in top_indices:
+        ch = _STATE.bm25_meta[i]
+
+        before = ""
+        after = ""
+        if i - 1 >= 0:
+            prev = _STATE.bm25_meta[i - 1]
+            if prev.source_file == ch.source_file:
+                before = prev.text
+        if i + 1 < len(_STATE.bm25_meta):
+            nxt = _STATE.bm25_meta[i + 1]
+            if nxt.source_file == ch.source_file:
+                after = nxt.text
+
+        heading = _short_heading(ch.heading_path)
+        vol = Path(ch.source_file).stem
+        title = f"{vol} | {heading}"
+
+        verbatim = (ch.text or "").strip()
+        snippet = re.sub(r"\s+", " ", verbatim)[:220].strip()
+
+        out.append(
+            {
+                "citation_id": ch.chunk_id,
+                "document": "MML",
+                "title": title,
+                "source_file": ch.source_file,
+                "heading": heading,
+                "location": ch.heading_path,
+                "verbatim": verbatim,
+                "context_before": (before or "").strip(),
+                "context_after": (after or "").strip(),
+                "snippet": snippet,
+                "retrieval_score": final_scores.get(i, 0.0),
+                "hit_query_count": len(hit_queries.get(i, [])),
             }
         )
 
