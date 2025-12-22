@@ -1,0 +1,10 @@
+{"id": "S001", "domain": "SYSTEM_HELP", "question": "how to start backend and front end", "must_include_strings": ["uvicorn", "streamlit", "ollama", "localhost"], "notes": "Runbook retrieval and grounded commands."}
+{"id": "S002", "domain": "SYSTEM_HELP", "question": "install dependencies for the api", "must_include_strings": ["pip", "requirements.txt", "python"], "notes": "API install steps."}
+{"id": "S003", "domain": "SYSTEM_HELP", "question": "how to run ingestion for legal corpus", "must_include_strings": ["python", "scripts/ingest.py", "embeddings"], "notes": "Ingestion guidance."}
+{"id": "S004", "domain": "SYSTEM_HELP", "question": "how to ingest repository docs", "must_include_strings": ["scripts/ingest_repo.py", "repo", "python"], "notes": "Repo ingestion runbook."}
+{"id": "S005", "domain": "SYSTEM_HELP", "question": "how to configure reranker model", "must_include_strings": ["RERANKER_MODEL", "RERANK_ENABLED", "environment"], "notes": "Reranker configuration."}
+{"id": "S006", "domain": "SYSTEM_HELP", "question": "start only the api service", "must_include_strings": ["uvicorn", "apps.api.main:app", "host"], "notes": "API only start."}
+{"id": "S007", "domain": "SYSTEM_HELP", "question": "how to run smoke test for legal retrieval", "must_include_strings": ["scripts/smoke_legal_multi_retrieval.py", "python", "retrieval"], "notes": "Smoke test guidance."}
+{"id": "S008", "domain": "SYSTEM_HELP", "question": "refresh embeddings when legal files change", "must_include_strings": ["ingest", "embeddings", "re-run"], "notes": "Refresh guidance."}
+{"id": "S009", "domain": "SYSTEM_HELP", "question": "how to run streamlit front end", "must_include_strings": ["streamlit", "run", "frontend"], "notes": "Front end start."}
+{"id": "S010", "domain": "SYSTEM_HELP", "question": "how to enable two-pass synthesis", "must_include_strings": ["TWO_PASS_ENABLED", "environment", "synthesis"], "notes": "Two-pass config."}

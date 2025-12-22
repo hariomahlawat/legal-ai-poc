@@ -1,0 +1,6 @@
+{
+  "min_legal_must_include_hit_rate": 0.75,
+  "min_system_must_include_hit_rate": 0.80,
+  "max_grounding_failures_total": 0,
+  "max_avg_retrieval_latency_ms": 1500
+}
