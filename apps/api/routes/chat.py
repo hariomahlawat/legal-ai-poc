@@ -23,16 +23,19 @@ Role = Literal["system", "user", "assistant"]
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: Role
     content: str
 
 
-    class ChatRequest(BaseModel):
-        case_id: Optional[str] = "default"
-        messages: List[ChatMessage]
-        mode: Optional[str] = "Chat"
-        want_citations: Optional[bool] = True
+class ChatRequest(BaseModel):
+    case_id: Optional[str] = "default"
+    messages: List[ChatMessage]
+    mode: Optional[str] = "Chat"
+    want_citations: Optional[bool] = True
     want_warnings: Optional[bool] = True
 
 
