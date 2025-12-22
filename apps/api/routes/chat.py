@@ -10,8 +10,10 @@ from pydantic import BaseModel
 from apps.api.services.citation_store import citation_store
 from apps.api.services.intent import classify_legal_object
 from apps.api.services.retrieval import retrieve_citations
+from apps.api.services.retrieval_repo import retrieve_repo_citations
 from apps.api.services.router import route_domain
 from apps.api.services.synthesis import synthesize_answer_grounded
+from apps.api.services.synthesis_repo import synthesize_repo_answer_grounded
 
 router = APIRouter()
 
@@ -75,20 +77,42 @@ def chat_stream(req: ChatRequest):
                     "domain": domain,
                 },
             )
-            system_help = (
-                "This looks like a system setup or runtime question. The system-help retrieval corpus "
-                "will be added next. For now, please specify what you are trying to start (API or UI) "
-                "and the error or command you ran."
-            )
-            for ch in system_help:
+
+            warnings: List[Dict[str, str]] = []
+            try:
+                citations = retrieve_repo_citations(question=question, top_k=6)
+                for c in citations:
+                    citation_store.upsert(c)
+
+                answer_text = synthesize_repo_answer_grounded(question, citations)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                warnings.append({"code": "SYS_HELP_ERROR", "message": f"System help failed: {exc}"})
+                answer_text = "Unable to retrieve system help at this time."
+                citations = []
+
+            for ch in answer_text:
                 yield sse_event("token", {"text": ch})
                 time.sleep(0.001)
 
             if req.want_citations:
-                yield sse_event("citations", {"items": []})
+                yield sse_event(
+                    "citations",
+                    {
+                        "items": [
+                            {
+                                "citation_id": c["citation_id"],
+                                "title": c.get("title", "System Help"),
+                                "source_file": c.get("source_file", ""),
+                                "heading": c.get("heading", ""),
+                                "snippet": c.get("snippet", ""),
+                            }
+                            for c in citations
+                        ]
+                    },
+                )
 
             if req.want_warnings:
-                yield sse_event("warnings", {"items": []})
+                yield sse_event("warnings", {"items": warnings})
             else:
                 yield sse_event("warnings", {"items": []})
 
