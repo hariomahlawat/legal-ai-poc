@@ -5,15 +5,30 @@ import json
 import logging
 import os
 import re
+import time
+import uuid
+
 import requests
 
+from apps.api.config import (
+    EVIDENCE_MAX_CHARS_PER_CITATION,
+    EVIDENCE_MAX_CHARS_TOTAL,
+    OLLAMA_CONNECT_TIMEOUT_SECS,
+    OLLAMA_MODEL_LEGAL,
+    OLLAMA_NUM_PREDICT,
+    OLLAMA_READ_TIMEOUT_SECS,
+    OLLAMA_TEMPERATURE,
+    OLLAMA_URL,
+    SYNTHESIS_MAX_CITATIONS,
+)
 
-OLLAMA_URL = os.getenv("OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-TWO_PASS_ENABLED = os.getenv("TWO_PASS_ENABLED", "true").lower() != "false"
-OLLAMA_HEALTH_TIMEOUT = float(os.getenv("OLLAMA_HEALTH_TIMEOUT", "5"))
-OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "45"))
-_OLLAMA_HEALTHY: Optional[bool] = None
+from .ollama_client import (
+    OllamaConnectionError,
+    OllamaError,
+    OllamaResponseError,
+    OllamaTimeoutError,
+    ollama_chat,
+)
 
 from .citation_store import citation_store
 from .claim_retry import build_claim_queries
@@ -27,7 +42,9 @@ logger = logging.getLogger(__name__)
 # ----------------------------
 # Configuration
 # ----------------------------
+TWO_PASS_ENABLED = os.getenv("TWO_PASS_ENABLED", "true").lower() != "false"
 MAX_CITATIONS_FOR_REPAIR = 18
+_OLLAMA_HEALTHY: Optional[bool] = None
 
 
 # ----------------------------
@@ -59,9 +76,25 @@ If evidence is insufficient for a point, add an assumption entry as 'Insufficien
 """.strip()
 
 
-def _build_user_prompt(question: str, citations: List[Dict[str, Any]], legal_object: Optional[str]) -> str:
+def _build_user_prompt(
+    question: str,
+    citations: List[Dict[str, Any]],
+    legal_object: Optional[str],
+    *,
+    max_chars_total: Optional[int] = None,
+    max_chars_per_citation: Optional[int] = None,
+) -> str:
     legal_line = f"Requested legal object: {legal_object}" if legal_object else "Requested legal object: (not specified)"
-    evidence_block = build_evidence_pack(question, citations) if citations else "(no evidence retrieved)"
+    evidence_block = (
+        build_evidence_pack(
+            question,
+            citations,
+            max_chars_total=max_chars_total or EVIDENCE_MAX_CHARS_TOTAL,
+            max_chars_per_citation=max_chars_per_citation or EVIDENCE_MAX_CHARS_PER_CITATION,
+        )
+        if citations
+        else "(no evidence retrieved)"
+    )
 
     return (
         f"{legal_line}\n\n"
@@ -87,7 +120,7 @@ def _ollama_available() -> bool:
     try:
         resp = requests.get(
             f"{OLLAMA_URL}/api/tags",
-            timeout=(OLLAMA_HEALTH_TIMEOUT, OLLAMA_HEALTH_TIMEOUT),
+            timeout=(OLLAMA_CONNECT_TIMEOUT_SECS, OLLAMA_CONNECT_TIMEOUT_SECS),
         )
         resp.raise_for_status()
         _OLLAMA_HEALTHY = True
@@ -271,6 +304,29 @@ def _record_citations(citations: List[Dict[str, Any]]) -> None:
         citation_store.upsert(citation)
 
 
+def _select_prompt_citations(citations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return citations[:SYNTHESIS_MAX_CITATIONS]
+
+
+def _shrink_citations_for_timeout(citations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    trimmed: List[Dict[str, Any]] = []
+    for citation in citations[:2]:
+        limited = dict(citation)
+        verbatim_source = (
+            citation.get("text")
+            or citation.get("verbatim")
+            or citation.get("snippet")
+            or citation.get("heading")
+            or ""
+        )
+        limited["verbatim"] = (verbatim_source or "")[:500]
+        limited.pop("context_before", None)
+        limited.pop("context_after", None)
+        trimmed.append(limited)
+
+    return trimmed
+
+
 def _claim_retry_repair(
     question: str,
     legal_object: Optional[str],
@@ -279,6 +335,7 @@ def _claim_retry_repair(
     citations: List[Dict[str, Any]],
     failures: List[Dict[str, Any]],
     telemetry: Dict[str, Any],
+    request_id: str,
 ) -> Tuple[str, bool, List[Dict[str, Any]], List[Dict[str, str]], List[Dict[str, Any]], bool]:
     if telemetry.get("claim_retry_completed"):
         return base_answer, False, failures, [], citations, False
@@ -339,7 +396,7 @@ def _claim_retry_repair(
     )
 
     merged_known_ids = {c.get("citation_id", "") for c in merged_citations if c.get("citation_id")}
-    repaired_answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
+    repaired_answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt, request_id)
     ok_format, issues, _unknown = _validate_answer(repaired_answer, merged_known_ids)
     repair_failures = failures
     grounding_ok = False
@@ -465,7 +522,7 @@ def _attempt_grounding_repair(
         f"{corrective_instruction}"
     )
 
-    repaired_answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
+    repaired_answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt, request_id)
     ok_format, issues, _unknown = _validate_answer(repaired_answer, known_ids)
     repair_failures = failures
     grounding_ok = False
@@ -476,30 +533,25 @@ def _attempt_grounding_repair(
     return repaired_answer, (ok_format and grounding_ok), repair_failures, issues
 
 
-def _call_ollama_chat(system_prompt: str, user_prompt: str) -> str:
+def _call_ollama_chat(
+    system_prompt: str,
+    user_prompt: str,
+    request_id: str,
+    *,
+    model: Optional[str] = None,
+    options: Optional[Dict[str, Any]] = None,
+) -> str:
     if not _ollama_available():
         raise RuntimeError(
             f"Ollama not reachable at {OLLAMA_URL}. Set OLLAMA_URL or start the service."
         )
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": {"temperature": 0.2},
-    }
+    messages = [
+        {"role": "system", "content": system_prompt.strip()},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    r = requests.post(
-        f"{OLLAMA_URL}/api/chat",
-        json=payload,
-        timeout=(OLLAMA_HEALTH_TIMEOUT, OLLAMA_READ_TIMEOUT),
-    )
-    r.raise_for_status()
-    data = r.json()
-    return (data.get("message", {}) or {}).get("content", "").strip()
+    return ollama_chat(model or OLLAMA_MODEL_LEGAL, messages, options or {}, request_id)
 
 
 # ----------------------------
@@ -538,6 +590,7 @@ def _run_planner(
     citations: List[Dict[str, Any]],
     legal_object: Optional[str],
     allowed_ids: set[str],
+    request_id: str,
 ) -> Tuple[Optional[Dict[str, Any]], int, bool]:
     """Run planner with a single retry on JSON/validation failure."""
     planner_retry_count = 0
@@ -545,7 +598,7 @@ def _run_planner(
 
     for attempt in range(2):
         try:
-            raw_plan = _call_ollama_chat(_SYSTEM_PROMPT_PLANNER, user_prompt)
+            raw_plan = _call_ollama_chat(_SYSTEM_PROMPT_PLANNER, user_prompt, request_id)
             plan_obj = json.loads(raw_plan)
             ok, errors = _validate_plan(plan_obj, allowed_ids)
             if ok:
@@ -572,6 +625,7 @@ def _run_writer(
     known_ids: set[str],
     allowed_ids_line: str,
     telemetry: Dict[str, Any],
+    request_id: str,
 ) -> Tuple[Optional[str], List[Dict[str, str]], int, bool, List[Dict[str, Any]]]:
     """Generate answer using validated plan and run validation with one retry."""
     warnings: List[Dict[str, str]] = []
@@ -594,7 +648,7 @@ def _run_writer(
     telemetry.setdefault("claim_retry_claims_selected", 0)
 
     try:
-        answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
+        answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt, request_id)
         ok, issues, _unknown = _validate_answer(answer, known_ids)
         if ok:
             grounding_ok, failures = verify_grounding(answer, citations)
@@ -610,6 +664,7 @@ def _run_writer(
                 citations,
                 failures,
                 telemetry,
+                request_id,
             )
             warnings.extend(repair_issues)
             if used_retry:
@@ -645,7 +700,7 @@ def _run_writer(
             + "Use the provided plan exactly. Ensure each procedural line ends with citation brackets.\n"
         )
         writer_retry_count += 1
-        answer2 = _call_ollama_chat(corrective, user_prompt)
+        answer2 = _call_ollama_chat(corrective, user_prompt, request_id)
         ok2, issues2, _unknown2 = _validate_answer(answer2, known_ids)
         if ok2:
             grounding_ok, failures = verify_grounding(answer2, citations)
@@ -667,6 +722,7 @@ def _run_writer(
                 citations,
                 failures,
                 telemetry,
+                request_id,
             )
             warnings.extend(repair_issues)
             if used_retry:
@@ -692,14 +748,41 @@ def _run_writer(
 
         warnings.extend(issues2)
         return answer2, warnings, writer_retry_count, False, citations
-    except Exception as e:
+    except OllamaTimeoutError as exc:
+        warnings.append(
+            {
+                "code": "LLM_TIMEOUT",
+                "message": f"Primary Ollama call timed out after {OLLAMA_READ_TIMEOUT_SECS}s: {exc}",
+            }
+        )
+        best_answer, reduced_warnings, reduced_citations = _attempt_reduced_prompt(
+            question, citations, legal_object, request_id
+        )
+        warnings.extend(reduced_warnings)
+        if best_answer:
+            warnings.append(
+                {
+                    "code": "TIMEOUT_RETRY",
+                    "message": "Returned answer from reduced prompt after timeout.",
+                }
+            )
+            return best_answer, warnings, writer_retry_count, True, reduced_citations
+
+        warnings.append(
+            {
+                "code": "FALLBACK_USED",
+                "message": "Timeout retry failed; returning fallback template.",
+            }
+        )
+        return _fallback_template(question, citations, legal_object), warnings, writer_retry_count, False, citations
+    except (OllamaConnectionError, OllamaResponseError, RuntimeError) as exc:
         warnings.append(
             {
                 "code": "LLM_UNAVAILABLE",
-                "message": f"Ollama/LLM unavailable or failed. Falling back to conservative template. Details: {e}",
+                "message": f"Ollama/LLM unavailable or failed. Falling back to conservative template. Details: {exc}",
             }
         )
-        return None, warnings, writer_retry_count, False, citations
+        return _fallback_template(question, citations, legal_object), warnings, writer_retry_count, False, citations
 
 
 def _fallback_template(question: str, citations: List[Dict[str, Any]], legal_object: Optional[str]) -> str:
@@ -749,6 +832,62 @@ def _fallback_template(question: str, citations: List[Dict[str, Any]], legal_obj
     )
 
 
+def _attempt_reduced_prompt(
+    question: str,
+    citations: List[Dict[str, Any]],
+    legal_object: Optional[str],
+    request_id: str,
+) -> Tuple[Optional[str], List[Dict[str, str]], List[Dict[str, Any]]]:
+    reduced_citations = _shrink_citations_for_timeout(citations)
+    if not reduced_citations:
+        return None, [], citations
+
+    reduced_prompt = _build_user_prompt(
+        question,
+        reduced_citations,
+        legal_object,
+        max_chars_total=min(EVIDENCE_MAX_CHARS_TOTAL, 1500),
+        max_chars_per_citation=500,
+    )
+
+    try:
+        answer = _call_ollama_chat(
+            _SYSTEM_PROMPT_BASE,
+            reduced_prompt,
+            request_id,
+            options={"num_predict": min(OLLAMA_NUM_PREDICT, 400), "temperature": OLLAMA_TEMPERATURE},
+        )
+    except OllamaError as exc:  # pragma: no cover - connectivity dependent
+        return None, [
+            {
+                "code": "TIMEOUT_RETRY_FAILED",
+                "message": f"Reduced prompt retry failed: {exc}",
+            }
+        ], reduced_citations
+
+    warnings: List[Dict[str, str]] = []
+    known_ids = {c.get("citation_id", "") for c in reduced_citations if c.get("citation_id")}
+    ok, issues, _unknown_ids = _validate_answer(answer, known_ids)
+    warnings.extend(issues)
+
+    if ok:
+        grounding_ok, failures = verify_grounding(answer, reduced_citations)
+        _log_grounding_result(grounding_ok, failures)
+        if grounding_ok:
+            return answer, warnings, reduced_citations
+
+        patched_answer = _patch_unsupported_bullets(answer, failures, known_ids, reduced_citations)
+        warnings.append(
+            {
+                "code": "GROUNDING_PATCHED",
+                "message": "Reduced prompt result patched for insufficient evidence.",
+            }
+        )
+        return patched_answer, warnings, reduced_citations
+
+    return answer, warnings, reduced_citations
+
+
 # ----------------------------
 # Generation helpers
 # ----------------------------
@@ -761,6 +900,7 @@ def _single_pass_answer(
     allowed_ids_line: str,
     user_prompt: str,
     telemetry: Dict[str, Any],
+    request_id: str,
 ) -> Tuple[str, List[Dict[str, str]], List[Dict[str, Any]]]:
     """Existing single-pass generation with validation and fallback."""
     warnings: List[Dict[str, str]] = []
@@ -771,7 +911,7 @@ def _single_pass_answer(
     telemetry.setdefault("grounding_failures_after_retry_count", 0)
 
     try:
-        answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
+        answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt, request_id)
         ok, issues, _unknown_ids = _validate_answer(answer, known_ids)
         if ok:
             grounding_ok, failures = verify_grounding(answer, citations)
@@ -787,6 +927,7 @@ def _single_pass_answer(
                 citations,
                 failures,
                 telemetry,
+                request_id,
             )
             warnings.extend(repair_issues)
             if used_retry:
@@ -823,7 +964,7 @@ def _single_pass_answer(
             + "Important: Use ONLY these IDs. Each step/proposition line must end with brackets.\n"
         )
 
-        answer2 = _call_ollama_chat(corrective, user_prompt)
+        answer2 = _call_ollama_chat(corrective, user_prompt, request_id)
         ok2, issues2, _unknown2 = _validate_answer(answer2, known_ids)
         if ok2:
             grounding_ok, failures = verify_grounding(answer2, citations)
@@ -845,6 +986,7 @@ def _single_pass_answer(
                 citations,
                 failures,
                 telemetry,
+                request_id,
             )
             warnings.extend(repair_issues)
             if used_retry:
@@ -872,11 +1014,38 @@ def _single_pass_answer(
         warnings.append({"code": "FALLBACK_USED", "message": "Model output could not be validated. Falling back to conservative template."})
         return _fallback_template(question, citations, legal_object), warnings, citations
 
-    except Exception as e:
+    except OllamaTimeoutError as exc:
+        warnings.append(
+            {
+                "code": "LLM_TIMEOUT",
+                "message": f"Primary Ollama call timed out after {OLLAMA_READ_TIMEOUT_SECS}s: {exc}",
+            }
+        )
+        best_answer, reduced_warnings, reduced_citations = _attempt_reduced_prompt(
+            question, citations, legal_object, request_id
+        )
+        warnings.extend(reduced_warnings)
+        if best_answer:
+            warnings.append(
+                {
+                    "code": "TIMEOUT_RETRY",
+                    "message": "Returned answer from reduced prompt after timeout.",
+                }
+            )
+            return best_answer, warnings, reduced_citations
+
+        warnings.append(
+            {
+                "code": "FALLBACK_USED",
+                "message": "Timeout retry failed; returning fallback template.",
+            }
+        )
+        return _fallback_template(question, citations, legal_object), warnings, citations
+    except (OllamaConnectionError, OllamaResponseError, RuntimeError) as exc:
         warnings.append(
             {
                 "code": "LLM_UNAVAILABLE",
-                "message": f"Ollama/LLM unavailable or failed. Falling back to conservative template. Details: {e}",
+                "message": f"Ollama/LLM unavailable or failed. Falling back to conservative template. Details: {exc}",
             }
         )
         return _fallback_template(question, citations, legal_object), warnings, citations
@@ -895,6 +1064,8 @@ def synthesize_answer_grounded(
     Produces a grounded answer using Ollama (if available), with post-generation validation.
     Retries once with a corrective prompt if citations or structure are invalid.
     """
+    start_time = time.monotonic()
+    request_id = str(uuid.uuid4())
     warnings: List[Dict[str, str]] = []
     telemetry: Dict[str, Any] = {
         "retrieval_retry_count": 0,
@@ -913,17 +1084,19 @@ def synthesize_answer_grounded(
             "telemetry": telemetry,
         }
 
-    known_ids = {c.get("citation_id", "") for c in citations if c.get("citation_id")}
+    prompt_citations = _select_prompt_citations(citations)
+    known_ids = {c.get("citation_id", "") for c in prompt_citations if c.get("citation_id")}
     allowed_ids_line = "Allowed citation IDs: " + ", ".join(sorted(known_ids))
 
-    user_prompt = _build_user_prompt(question, citations, legal_object)
+    user_prompt = _build_user_prompt(question, prompt_citations, legal_object)
     evidence_length = len(user_prompt.split("EVIDENCE:\n", maxsplit=1)[-1])
-    full_text_length = sum(len((c.get("verbatim", "") or "")) for c in citations)
+    full_text_length = sum(len((c.get("verbatim", "") or "")) for c in prompt_citations)
     reduction_ratio = (evidence_length / full_text_length) if full_text_length else 0
     logger.info(
         "evidence_pack_built",
         extra={
-            "citation_count": len(citations),
+            "citation_count": len(prompt_citations),
+            "total_citations": len(citations),
             "evidence_length": evidence_length,
             "full_text_length": full_text_length,
             "reduction_ratio": round(reduction_ratio, 4) if reduction_ratio else 0,
@@ -932,8 +1105,12 @@ def synthesize_answer_grounded(
 
     logger.info("two_pass_config", extra={"two_pass_enabled": TWO_PASS_ENABLED})
 
+    prompt_chars_total = len(_SYSTEM_PROMPT_BASE) + len(user_prompt)
+
     if TWO_PASS_ENABLED:
-        plan, planner_retry_count, planner_success = _run_planner(question, citations, legal_object, known_ids)
+        plan, planner_retry_count, planner_success = _run_planner(
+            question, prompt_citations, legal_object, known_ids, request_id
+        )
         logger.info(
             "planner_result",
             extra={
@@ -953,12 +1130,13 @@ def synthesize_answer_grounded(
 
             answer, writer_warnings, writer_retry_count, writer_success, used_citations = _run_writer(
                 question,
-                citations,
+                prompt_citations,
                 legal_object,
                 plan,
                 known_ids,
                 allowed_ids_line,
                 telemetry,
+                request_id,
             )
             warnings.extend(writer_warnings)
             logger.info(
@@ -978,12 +1156,32 @@ def synthesize_answer_grounded(
 
     answer, single_pass_warnings, final_citations = _single_pass_answer(
         question,
-        citations,
+        prompt_citations,
         legal_object,
         known_ids,
         allowed_ids_line,
         user_prompt,
         telemetry,
+        request_id,
     )
     warnings.extend(single_pass_warnings)
+
+    elapsed = time.monotonic() - start_time
+    fallback_used = any(
+        w.get("code") in {"FALLBACK_USED", "LLM_UNAVAILABLE", "LLM_TIMEOUT"} for w in warnings
+    )
+    logger.info(
+        "synthesis_request",
+        extra={
+            "request_id": request_id,
+            "model": OLLAMA_MODEL_LEGAL,
+            "citations_used_for_prompt": len(prompt_citations),
+            "evidence_pack_chars": evidence_length,
+            "prompt_chars_total": prompt_chars_total,
+            "timeout_read_secs": OLLAMA_READ_TIMEOUT_SECS,
+            "elapsed_secs": round(elapsed, 3),
+            "fallback_used": fallback_used,
+        },
+    )
+
     return {"answer": answer, "warnings": warnings, "telemetry": telemetry, "citations": final_citations}

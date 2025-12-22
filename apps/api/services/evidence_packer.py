@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any, List, Sequence, Tuple
 import re
 
+from apps.api.config import EVIDENCE_MAX_CHARS_PER_CITATION, EVIDENCE_MAX_CHARS_TOTAL
+
 # ----------------------------
 # Evidence packer
 # ----------------------------
@@ -13,6 +15,8 @@ def build_evidence_pack(
     citations: List[dict[str, Any]],
     max_sentences_per_chunk: int = 5,
     max_total_sentences: int = 40,
+    max_chars_total: int = EVIDENCE_MAX_CHARS_TOTAL,
+    max_chars_per_citation: int = EVIDENCE_MAX_CHARS_PER_CITATION,
 ) -> str:
     """
     Returns a compact evidence string for prompt injection.
@@ -24,15 +28,24 @@ def build_evidence_pack(
     question_tokens = _tokenize(question)
     lines: List[str] = []
     total_sentences = 0
+    total_chars = 0
+    included_citations = 0
 
     for citation in citations:
-        if total_sentences >= max_total_sentences:
+        if total_sentences >= max_total_sentences and total_chars >= max_chars_total and included_citations >= 2:
             break
 
         cid = citation.get("citation_id", "")
         heading_path = citation.get("heading_path") or citation.get("location") or citation.get("heading") or ""
         source_file = citation.get("source_file", "")
-        verbatim = (citation.get("verbatim", "") or "").strip()
+        verbatim_source = (
+            citation.get("text")
+            or citation.get("verbatim")
+            or citation.get("snippet")
+            or citation.get("heading")
+            or ""
+        )
+        verbatim = _normalize_whitespace(verbatim_source)[:max_chars_per_citation]
 
         sentences = _split_sentences(verbatim)
         if not sentences:
@@ -102,13 +115,31 @@ def build_evidence_pack(
         if not selected:
             selected = ["(no content)"]
 
-        lines.append(f"[{cid}] {heading_path} | {source_file}")
+        entry_lines: List[str] = [f"[{cid}] {heading_path} | {source_file}"]
 
         for s in selected:
             if total_sentences >= max_total_sentences:
                 break
-            lines.append(f"- {s.strip()}")
+            entry_lines.append(f"- {s.strip()}")
             total_sentences += 1
+
+        block = "\n".join(entry_lines).strip()
+
+        prospective_length = total_chars + len(block) + (1 if lines else 0)
+        if prospective_length > max_chars_total and included_citations >= 2:
+            break
+
+        if prospective_length > max_chars_total:
+            allowed = max_chars_total - total_chars - (1 if lines else 0)
+            block = block[:max(0, allowed)]
+
+        if not block:
+            block = entry_lines[0][:max_chars_per_citation]
+
+        separator_chars = 1 if lines else 0
+        lines.append(block)
+        total_chars += len(block) + separator_chars
+        included_citations += 1
 
     return "\n".join(lines).strip()
 
@@ -121,6 +152,10 @@ def build_evidence_pack(
 def _tokenize(text: str) -> set[str]:
     tokens = re.split(r"[^A-Za-z0-9]+", (text or "").lower())
     return {t for t in tokens if len(t) >= 3}
+
+
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
 
 
 def _split_sentences(text: str) -> List[str]:

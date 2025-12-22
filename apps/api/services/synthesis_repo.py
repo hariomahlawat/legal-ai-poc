@@ -1,19 +1,32 @@
 from __future__ import annotations
 
-import os
-import re
 import logging
+import re
+import uuid
 from typing import Any, Dict, List, Set, Tuple
 
 import requests
 
+from apps.api.config import (
+    OLLAMA_CONNECT_TIMEOUT_SECS,
+    OLLAMA_MODEL_SYS,
+    OLLAMA_NUM_PREDICT,
+    OLLAMA_READ_TIMEOUT_SECS,
+    OLLAMA_TEMPERATURE,
+    OLLAMA_URL,
+)
+
+from .ollama_client import (
+    OllamaConnectionError,
+    OllamaError,
+    OllamaResponseError,
+    OllamaTimeoutError,
+    ollama_chat,
+)
+
 # ============================
 # Configuration
 # ============================
-OLLAMA_URL = os.getenv("OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-OLLAMA_HEALTH_TIMEOUT = float(os.getenv("OLLAMA_HEALTH_TIMEOUT", "5"))
-OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "45"))
 _OLLAMA_HEALTHY: bool | None = None
 
 # ============================
@@ -96,7 +109,7 @@ def _ollama_available() -> bool:
     try:
         resp = requests.get(
             f"{OLLAMA_URL}/api/tags",
-            timeout=(OLLAMA_HEALTH_TIMEOUT, OLLAMA_HEALTH_TIMEOUT),
+            timeout=(OLLAMA_CONNECT_TIMEOUT_SECS, OLLAMA_CONNECT_TIMEOUT_SECS),
         )
         resp.raise_for_status()
         _OLLAMA_HEALTHY = True
@@ -111,29 +124,23 @@ def _ollama_available() -> bool:
 # LLM and Fallback Helpers
 # ============================
 
-def _call_ollama_chat(system_prompt: str, user_prompt: str) -> str:
+def _call_ollama_chat(system_prompt: str, user_prompt: str, request_id: str) -> str:
     if not _ollama_available():
         raise RuntimeError(
             f"Ollama not reachable at {OLLAMA_URL}. Set OLLAMA_URL or start the service."
         )
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": {"temperature": 0.2},
-    }
-    resp = requests.post(
-        f"{OLLAMA_URL}/api/chat",
-        json=payload,
-        timeout=(OLLAMA_HEALTH_TIMEOUT, OLLAMA_READ_TIMEOUT),
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    return ollama_chat(
+        OLLAMA_MODEL_SYS,
+        messages,
+        {"temperature": OLLAMA_TEMPERATURE, "num_predict": OLLAMA_NUM_PREDICT},
+        request_id,
     )
-    resp.raise_for_status()
-    data = resp.json()
-    return (data.get("message", {}) or {}).get("content", "").strip()
 
 
 def _fallback_answer(question: str, citations: List[Dict[str, Any]]) -> str:
@@ -169,18 +176,26 @@ def _fallback_answer(question: str, citations: List[Dict[str, Any]]) -> str:
 # ============================
 
 def synthesize_repo_answer_grounded(question: str, citations: List[Dict[str, Any]]) -> str:
+    request_id = str(uuid.uuid4())
     known_ids = {c.get("citation_id", "") for c in citations if c.get("citation_id")}
     if not known_ids:
         return _fallback_answer(question, citations)
 
     user_prompt = _build_user_prompt(question, citations)
-    answer = _call_ollama_chat(_SYSTEM_PROMPT, user_prompt)
-    ok, issues = _validate_answer(answer, known_ids)
-
-    if not ok:
-        retry_prompt = _SYSTEM_PROMPT + "\nAlways end every bullet with a SYS citation and include all required headings."
-        answer = _call_ollama_chat(retry_prompt, user_prompt)
+    try:
+        answer = _call_ollama_chat(_SYSTEM_PROMPT, user_prompt, request_id)
         ok, issues = _validate_answer(answer, known_ids)
+
+        if not ok:
+            retry_prompt = _SYSTEM_PROMPT + "\nAlways end every bullet with a SYS citation and include all required headings."
+            answer = _call_ollama_chat(retry_prompt, user_prompt, request_id)
+            ok, issues = _validate_answer(answer, known_ids)
+    except (OllamaTimeoutError, OllamaConnectionError, OllamaResponseError) as exc:
+        logger.warning(
+            "repo_synthesis_fallback",
+            extra={"request_id": request_id, "reason": str(exc)},
+        )
+        return _fallback_answer(question, citations)
 
     if ok:
         return answer
