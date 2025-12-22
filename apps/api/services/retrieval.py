@@ -606,3 +606,24 @@ def retrieve_citations_multi(
         )
 
     return out
+
+
+# ----------------------------
+# Convenience helpers
+# ----------------------------
+def retrieve_for_query_variants(
+    query_variants: List[str],
+    top_k: int = 8,
+    legal_object: Optional[str] = None,
+    lexical_k: int = 60,
+    semantic_k: int = 60,
+) -> List[Dict[str, Any]]:
+    """Wrapper to retrieve citations for pre-built query variants."""
+
+    return retrieve_citations_multi(
+        questions=query_variants,
+        top_k=top_k,
+        legal_object=legal_object,
+        lexical_k=lexical_k,
+        semantic_k=semantic_k,
+    )
