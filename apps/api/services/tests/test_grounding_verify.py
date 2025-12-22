@@ -90,3 +90,21 @@ def test_multiple_citations_one_supports():
 
     assert ok is True
     assert failures == []
+
+
+def test_short_bullet_uses_small_overlap_threshold():
+    answer = (
+        "Applicable provisions:\n"
+        "- Placeholder [CIT-2]\n\n"
+        "Step-by-step procedure:\n"
+        "- Inform accused. [CIT-2]\n\n"
+        "Common mistakes to avoid:\n"
+        "- None [CIT-1]\n\n"
+        "If facts are missing:\n"
+        "- Provide missing details. [CIT-1]"
+    )
+
+    ok, failures = verify_grounding(answer, _sample_citations())
+
+    assert ok is True
+    assert failures == []

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from apps.api.services.intent import classify_legal_object
 from apps.api.services.query_expansion import expand_queries
@@ -180,24 +180,42 @@ def _evaluate_question(item: QuestionItem, mode: str) -> QuestionResult:
     answer: Optional[str] = None
     grounding_ok: Optional[bool] = None
     grounding_failures_count = 0
+    claim_bullets_count = 0
+    avg_best_overlap = 0.0
+    min_best_overlap = 0
     synthesis_latency_ms = None
 
     if mode == "full":
         synth_start = time.perf_counter()
         if domain == "LEGAL":
-            answer = synthesize_answer_grounded(item.question, citations)
-            grounding_ok, grounding_failures = verify_grounding(answer, citations)
+            answer_payload = synthesize_answer_grounded(item.question, citations)
+            answer = answer_payload.get("answer") if isinstance(answer_payload, dict) else answer_payload
+            grounding_ok, grounding_failures, grounding_stats = verify_grounding(
+                answer,
+                citations,
+                return_metrics=True,
+            )
+            best_overlaps = grounding_stats.get("best_overlaps", []) if grounding_stats else []
+            claim_bullets_count = grounding_stats.get("bullets_checked", 0) if grounding_stats else 0
             grounding_failures_count = len(grounding_failures)
+            avg_best_overlap = mean(best_overlaps) if best_overlaps else 0.0
+            min_best_overlap = min(best_overlaps) if best_overlaps else 0
         elif domain == "SYSTEM_HELP":
             answer = synthesize_repo_answer_grounded(item.question, citations)
             grounding_ok = True
             grounding_failures_count = 0
+            claim_bullets_count = 0
+            avg_best_overlap = 0.0
+            min_best_overlap = 0
         synthesis_latency_ms = (time.perf_counter() - synth_start) * 1000.0
         metrics.update(
             {
                 "answer_length_chars": len(answer or ""),
                 "grounding_ok": grounding_ok,
                 "grounding_failures_count": grounding_failures_count,
+                "claim_bullets_count": claim_bullets_count,
+                "avg_best_overlap": avg_best_overlap,
+                "min_best_overlap": min_best_overlap,
                 "latency_ms_synthesis": synthesis_latency_ms,
                 "latency_ms_total": (time.perf_counter() - start_time) * 1000.0,
             }
@@ -350,6 +368,47 @@ def _print_summary(run_id: str, summary: Dict[str, Any], mode: str, report_path:
 
 
 # =====================
+# Calibration sweep
+# =====================
+def _run_grounding_sweep(results: List[QuestionResult]) -> None:
+    combos = [(s, r) for s in (1, 2) for r in (2, 3, 4)]
+    print("\nGrounding threshold sweep (failures_total):")
+
+    best_choice: Optional[Tuple[int, int]] = None
+    best_score: Optional[Tuple[int, int]] = None
+
+    for small, regular in combos:
+        failures_total = 0
+        for result in results:
+            if result.domain != "LEGAL" or not result.answer:
+                continue
+            _ok, failures, _stats = verify_grounding(
+                result.answer,
+                result.citations,
+                min_overlap_small=small,
+                min_overlap_regular=regular,
+                return_metrics=True,
+            )
+            failures_total += len(failures)
+
+        print(f"  small={small} regular={regular} -> failures_total={failures_total}")
+
+        if failures_total == 0:
+            score = (regular, small)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_choice = (small, regular)
+
+    if best_choice:
+        print(
+            f"Recommended thresholds: VERIFY_MIN_OVERLAP_SMALL={best_choice[0]}, "
+            f"VERIFY_MIN_OVERLAP_REGULAR={best_choice[1]} (zero grounding failures)"
+        )
+    else:
+        print("No zero-failure combination found; consider reviewing evidence or prompts.")
+
+
+# =====================
 # Command-line handling
 # =====================
 def parse_args() -> argparse.Namespace:
@@ -360,6 +419,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("scripts/eval_config.json"),
         help="Path to regression gate configuration",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Run threshold sweep (full mode only) to report grounding failure counts",
     )
     return parser.parse_args()
 
@@ -388,6 +452,12 @@ def main() -> int:
     report = _build_report(run_id, results, summary, mode)
     report_path = _write_report(run_id, report)
     _print_summary(run_id, summary, mode, report_path)
+
+    if args.sweep:
+        if mode != "full":
+            print("Sweep mode is only available in full evaluation mode.")
+        else:
+            _run_grounding_sweep(results)
 
     passed = _apply_gates(summary, mode, config)
     return 0 if passed else 2

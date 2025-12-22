@@ -210,7 +210,7 @@ def _log_grounding_result(
 
 
 def _patch_unsupported_bullets(
-    answer: str, failures: List[Dict[str, Any]], known_ids: set[str]
+    answer: str, failures: List[Dict[str, Any]], known_ids: set[str], citations: List[Dict[str, Any]]
 ) -> str:
     lines = (answer or "").splitlines()
     start_idx = None
@@ -235,7 +235,7 @@ def _patch_unsupported_bullets(
         if failure:
             best_id = (failure.get("support") or {}).get("best_id")
             if not best_id:
-                best_id = sorted(known_ids)[0] if known_ids else None
+                best_id = _choose_best_citation_id(known_ids, citations)
             citation_block = f" [{best_id}]" if best_id else ""
             lines[line_idx] = (
                 "- Insufficient evidence in the provided corpus to state this step precisely." + citation_block
@@ -243,6 +243,31 @@ def _patch_unsupported_bullets(
         bullet_counter += 1
 
     return "\n".join(lines)
+
+
+def _choose_best_citation_id(known_ids: set[str], citations: List[Dict[str, Any]]) -> Optional[str]:
+    if not known_ids:
+        return None
+
+    candidate_list = [c for c in citations if c.get("citation_id") in known_ids]
+    if not candidate_list:
+        return sorted(known_ids)[0]
+
+    def _score(citation: Dict[str, Any]) -> Tuple[int, float, int, float, str]:
+        rerank = citation.get("rerank_score")
+        retrieval = citation.get("retrieval_score")
+        rerank_valid = 1 if isinstance(rerank, (int, float)) else 0
+        retrieval_valid = 1 if isinstance(retrieval, (int, float)) else 0
+        return (
+            rerank_valid,
+            rerank if rerank_valid else float("-inf"),
+            retrieval_valid,
+            retrieval if retrieval_valid else float("-inf"),
+            citation.get("citation_id", ""),
+        )
+
+    best = max(candidate_list, key=_score)
+    return best.get("citation_id")
 
 
 def _attempt_grounding_repair(
@@ -272,7 +297,9 @@ def _attempt_grounding_repair(
 
     corrective_instruction = (
         "Grounding failures detected in Step-by-step procedure. Revise these bullets to match the provided evidence. "
-        "If evidence is insufficient, explicitly say so and cite the closest relevant citation ID."
+        "Do not introduce new steps beyond what the evidence states. "
+        "If the evidence does not state a step precisely, replace it with: "
+        "'Insufficient evidence in the provided corpus to state this step precisely.' and cite the closest relevant citation ID."
     )
 
     user_prompt = (
@@ -417,7 +444,7 @@ def _run_writer(
                 )
                 return repaired_answer, warnings, writer_retry_count, True
 
-            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids)
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids, citations)
             warnings.append(
                 {
                     "code": "GROUNDING_PATCHED",
@@ -470,7 +497,7 @@ def _run_writer(
                 )
                 return repaired_answer, warnings, writer_retry_count, True
 
-            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids)
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids, citations)
             warnings.append(
                 {
                     "code": "GROUNDING_PATCHED",
@@ -577,13 +604,13 @@ def _single_pass_answer(
                         "code": "GROUNDING_REPAIRED",
                         "message": "Answer required grounding repair; a corrected answer was produced.",
                     }
-                )
-                return repaired_answer, warnings
+            )
+            return repaired_answer, warnings
 
-            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids)
-            warnings.append(
-                {
-                    "code": "GROUNDING_PATCHED",
+        patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids, citations)
+        warnings.append(
+            {
+                "code": "GROUNDING_PATCHED",
                     "message": "Unsupported bullets were replaced due to insufficient evidence.",
                 }
             )
@@ -634,7 +661,7 @@ def _single_pass_answer(
                 )
                 return repaired_answer, warnings
 
-            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids)
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids, citations)
             warnings.append(
                 {
                     "code": "GROUNDING_PATCHED",
