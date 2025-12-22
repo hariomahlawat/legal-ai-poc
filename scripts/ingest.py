@@ -5,6 +5,7 @@ import hashlib
 import pickle
 import re
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -14,6 +15,13 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
+
+# ----------------------------
+# Environment setup
+# ----------------------------
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from scripts.chunking_legal import chunk_legal_markdown
 
