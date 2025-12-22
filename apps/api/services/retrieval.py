@@ -393,6 +393,23 @@ def retrieve_citations_multi(
         if not candidate_is:
             continue
 
+        # 3b) Optional hard-focus filter (prevents obvious COI vs Court-Martial drift)
+        if legal_object in ("Court of Inquiry", "Court-Martial"):
+
+            def _focus_match(ch: _Chunk) -> bool:
+                hp = (ch.heading_path or "").lower()
+                tx = (ch.text or "").lower()
+                if legal_object == "Court of Inquiry":
+                    return ("court of inquiry" in hp) or ("court of inquiry" in tx)
+                if legal_object == "Court-Martial":
+                    return ("court-martial" in hp) or ("court-martial" in tx) or ("courts-martial" in tx)
+                return True
+
+            focus_candidates = [i for i in candidate_is if 0 <= i < len(_STATE.bm25_meta) and _focus_match(_STATE.bm25_meta[i])]
+            # Use focused set only if it is non-empty; otherwise keep the broader candidate set.
+            if focus_candidates:
+                candidate_is = set(focus_candidates)
+
         for i in candidate_is:
             if i < 0 or i >= len(_STATE.bm25_meta):
                 continue
