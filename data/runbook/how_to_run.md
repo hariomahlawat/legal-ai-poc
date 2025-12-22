@@ -15,8 +15,14 @@
 - Default port: 8000. Change with `--port <port>`.
 
 ## Start Streamlit UI
-- Command (from repo root): `streamlit run apps/ui/streamlit_app.py --server.port 8501`.
+- Command (from repo root): `streamlit run apps/ui/streamlit_app.py --server.port 8501 --server.address 0.0.0.0`.
 - Default port: 8501. Change with `--server.port <port>`.
+
+## Build / refresh the legal index (required before legal retrieval)
+Legal retrieval loads the latest version under `data/index_legal/`. If this directory does not exist, build it once:
+
+- Command (from repo root): `python scripts/ingest.py`
+- Optional: pin a specific version by setting `LEGAL_INDEX_VERSION=vYYYYMMDD_N` in `.env`.
 
 ## Health Checks
 - API health: `curl http://127.0.0.1:8000/health`.
