@@ -53,7 +53,48 @@ def build_evidence_pack(
         if max_score == 0:
             selected = [s for s, _, _, _ in sentence_scores[: min(2, per_chunk_limit)]]
         else:
-            selected = [s for s, _, _, _ in sentence_scores[:per_chunk_limit]]
+            selected_indices: List[int] = []
+
+            # Anchor, early, late coverage selections
+            anchor_idx = _find_anchor_sentence(sentences)
+            early_idx = _find_positional_sentence(sentences, early=True)
+            late_idx = _find_positional_sentence(sentences, early=False)
+
+            required_indices: List[int] = []
+            if anchor_idx is not None:
+                required_indices.append(anchor_idx)
+            if early_idx is not None and early_idx not in required_indices:
+                required_indices.append(early_idx)
+            if late_idx is not None and late_idx not in required_indices:
+                required_indices.append(late_idx)
+
+            for req_idx in required_indices:
+                if len(selected_indices) >= per_chunk_limit:
+                    break
+                selected_indices.append(req_idx)
+
+            for _sentence, _overlap, _heading_overlap, idx in sentence_scores:
+                if len(selected_indices) >= per_chunk_limit:
+                    break
+                if idx not in selected_indices:
+                    selected_indices.append(idx)
+
+            scored_lookup = {idx: (s, o, h) for s, o, h, idx in sentence_scores}
+            selection_with_priority: List[Tuple[bool, int, int, int]] = []
+            required_set = set(required_indices)
+            for idx in selected_indices:
+                score_tuple = scored_lookup.get(idx, (sentences[idx], 0, 0))
+                selection_with_priority.append(
+                    (
+                        idx in required_set,
+                        score_tuple[1],
+                        score_tuple[2],
+                        idx,
+                    )
+                )
+
+            selection_with_priority.sort(key=lambda x: (0 if x[0] else 1, -x[1], -x[2], x[3]))
+            selected = [sentences[idx] for _required, _o, _h, idx in selection_with_priority[:per_chunk_limit]]
 
         if not selected and sentences:
             selected = sentences[: min(2, per_chunk_limit or 1)]
@@ -127,3 +168,45 @@ def _score_sentences(
 
     scored.sort(key=lambda x: (-x[1], -x[2], x[3]))
     return scored
+
+
+def _find_anchor_sentence(sentences: Sequence[str]) -> int | None:
+    anchor_keywords = {
+        "shall",
+        "will",
+        "must",
+        "may",
+        "procedure",
+        "authority",
+        "convening",
+        "evidence",
+        "record",
+        "witness",
+        "recommend",
+    }
+    numbered_pattern = re.compile(r"^\s*(?:\(?[0-9]+\)?[.)]|\([a-z]\)|[a-z]\))")
+
+    for idx, sentence in enumerate(sentences):
+        lowered = sentence.lower()
+        if numbered_pattern.match(sentence.strip()):
+            return idx
+        if any(word in lowered for word in anchor_keywords):
+            return idx
+    return None
+
+
+def _find_positional_sentence(sentences: Sequence[str], early: bool = True) -> int | None:
+    if not sentences:
+        return None
+
+    count = len(sentences)
+    band = max(1, int(count * 0.2))
+    if early:
+        candidate_indices = range(0, band)
+    else:
+        candidate_indices = range(max(0, count - band), count)
+
+    for idx in candidate_indices:
+        if 0 <= idx < count:
+            return idx
+    return None
