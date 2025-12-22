@@ -13,6 +13,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 TWO_PASS_ENABLED = os.getenv("TWO_PASS_ENABLED", "true").lower() != "false"
 
 from .evidence_packer import build_evidence_pack
+from .grounding_verify import verify_grounding
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,119 @@ def _validate_plan(plan: Any, allowed_ids: set[str]) -> Tuple[bool, List[str]]:
     return len(errors) == 0, errors
 
 
+# ----------------------------
+# Grounding verification helpers
+# ----------------------------
+def _log_grounding_result(
+    grounding_ok: bool,
+    failures: List[Dict[str, Any]],
+    repair_attempted: bool = False,
+    repair_success: bool = False,
+) -> None:
+    logger.info(
+        "grounding_verification",
+        extra={
+            "grounding_ok": grounding_ok,
+            "grounding_failures_count": len(failures),
+            "grounding_repair_attempted": repair_attempted,
+            "grounding_repair_success": repair_success,
+            "grounding_failures": [
+                {
+                    "bullet_index": f.get("bullet_index"),
+                    "best_id": (f.get("support") or {}).get("best_id"),
+                    "overlap": (f.get("support") or {}).get("overlap"),
+                    "claim_text": (f.get("claim_text", "") or "")[:120],
+                }
+                for f in failures
+            ],
+        },
+    )
+
+
+def _patch_unsupported_bullets(
+    answer: str, failures: List[Dict[str, Any]], known_ids: set[str]
+) -> str:
+    lines = (answer or "").splitlines()
+    start_idx = None
+    for idx, line in enumerate(lines):
+        if line.strip().lower() == "step-by-step procedure:":
+            start_idx = idx + 1
+            break
+    if start_idx is None:
+        return answer
+
+    failure_map = {f.get("bullet_index"): f for f in failures}
+    bullet_counter = 0
+
+    for line_idx in range(start_idx, len(lines)):
+        stripped = lines[line_idx].strip()
+        if stripped.endswith(":") and not stripped.startswith("-"):
+            break
+        if not stripped.startswith("- "):
+            continue
+
+        failure = failure_map.get(bullet_counter)
+        if failure:
+            best_id = (failure.get("support") or {}).get("best_id")
+            if not best_id:
+                best_id = sorted(known_ids)[0] if known_ids else None
+            citation_block = f" [{best_id}]" if best_id else ""
+            lines[line_idx] = (
+                "- Insufficient evidence in the provided corpus to state this step precisely." + citation_block
+            )
+        bullet_counter += 1
+
+    return "\n".join(lines)
+
+
+def _attempt_grounding_repair(
+    question: str,
+    citations: List[Dict[str, Any]],
+    legal_object: Optional[str],
+    plan: Optional[Dict[str, Any]],
+    known_ids: set[str],
+    failures: List[Dict[str, Any]],
+) -> Tuple[str, bool, List[Dict[str, Any]], List[Dict[str, str]]]:
+    base_user_prompt = _build_user_prompt(question, citations, legal_object)
+    plan_block = ""
+    if plan:
+        plan_block = f"Validated plan (JSON):\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"
+
+    failures_desc = []
+    for failure in failures:
+        support = failure.get("support") or {}
+        failures_desc.append(
+            "- Bullet {idx}: '{claim}' (best overlap {overlap} with {best_id})".format(
+                idx=failure.get("bullet_index"),
+                claim=failure.get("claim_text", ""),
+                overlap=support.get("overlap", 0),
+                best_id=support.get("best_id"),
+            )
+        )
+
+    corrective_instruction = (
+        "Grounding failures detected in Step-by-step procedure. Revise these bullets to match the provided evidence. "
+        "If evidence is insufficient, explicitly say so and cite the closest relevant citation ID."
+    )
+
+    user_prompt = (
+        f"{base_user_prompt}\n\n"
+        f"{plan_block}"
+        f"Grounding failures:\n{chr(10).join(failures_desc)}\n\n"
+        f"{corrective_instruction}"
+    )
+
+    repaired_answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
+    ok_format, issues, _unknown = _validate_answer(repaired_answer, known_ids)
+    repair_failures = failures
+    grounding_ok = False
+    if ok_format:
+        grounding_ok, repair_failures = verify_grounding(repaired_answer, citations)
+
+    _log_grounding_result(grounding_ok, repair_failures, repair_attempted=True, repair_success=grounding_ok and ok_format)
+    return repaired_answer, (ok_format and grounding_ok), repair_failures, issues
+
+
 def _call_ollama_chat(system_prompt: str, user_prompt: str) -> str:
     payload = {
         "model": OLLAMA_MODEL,
@@ -280,7 +394,37 @@ def _run_writer(
         answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
         ok, issues, _unknown = _validate_answer(answer, known_ids)
         if ok:
-            return answer, warnings, writer_retry_count, True
+            grounding_ok, failures = verify_grounding(answer, citations)
+            _log_grounding_result(grounding_ok, failures)
+            if grounding_ok:
+                return answer, warnings, writer_retry_count, True
+
+            repaired_answer, repair_success, repair_failures, repair_issues = _attempt_grounding_repair(
+                question,
+                citations,
+                legal_object,
+                plan,
+                known_ids,
+                failures,
+            )
+            warnings.extend(repair_issues)
+            if repair_success:
+                warnings.append(
+                    {
+                        "code": "GROUNDING_REPAIRED",
+                        "message": "Answer required grounding repair; a corrected answer was produced.",
+                    }
+                )
+                return repaired_answer, warnings, writer_retry_count, True
+
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids)
+            warnings.append(
+                {
+                    "code": "GROUNDING_PATCHED",
+                    "message": "Unsupported bullets were replaced due to insufficient evidence.",
+                }
+            )
+            return patched_answer, warnings, writer_retry_count, True
 
         warnings.extend(issues)
         corrective = (
@@ -297,8 +441,43 @@ def _run_writer(
         answer2 = _call_ollama_chat(corrective, user_prompt)
         ok2, issues2, _unknown2 = _validate_answer(answer2, known_ids)
         if ok2:
-            warnings.append({"code": "REPAIRED_OUTPUT", "message": "Model output required repair; a corrected answer was produced."})
-            return answer2, warnings, writer_retry_count, True
+            grounding_ok, failures = verify_grounding(answer2, citations)
+            _log_grounding_result(grounding_ok, failures)
+            if grounding_ok:
+                warnings.append(
+                    {
+                        "code": "REPAIRED_OUTPUT",
+                        "message": "Model output required repair; a corrected answer was produced.",
+                    }
+                )
+                return answer2, warnings, writer_retry_count, True
+
+            repaired_answer, repair_success, repair_failures, repair_issues = _attempt_grounding_repair(
+                question,
+                citations,
+                legal_object,
+                plan,
+                known_ids,
+                failures,
+            )
+            warnings.extend(repair_issues)
+            if repair_success:
+                warnings.append(
+                    {
+                        "code": "GROUNDING_REPAIRED",
+                        "message": "Answer required grounding repair; a corrected answer was produced.",
+                    }
+                )
+                return repaired_answer, warnings, writer_retry_count, True
+
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids)
+            warnings.append(
+                {
+                    "code": "GROUNDING_PATCHED",
+                    "message": "Unsupported bullets were replaced due to insufficient evidence.",
+                }
+            )
+            return patched_answer, warnings, writer_retry_count, True
 
         warnings.extend(issues2)
         return answer2, warnings, writer_retry_count, False
@@ -378,7 +557,37 @@ def _single_pass_answer(
         answer = _call_ollama_chat(_SYSTEM_PROMPT_BASE, user_prompt)
         ok, issues, _unknown_ids = _validate_answer(answer, known_ids)
         if ok:
-            return answer, warnings
+            grounding_ok, failures = verify_grounding(answer, citations)
+            _log_grounding_result(grounding_ok, failures)
+            if grounding_ok:
+                return answer, warnings
+
+            repaired_answer, repair_success, repair_failures, repair_issues = _attempt_grounding_repair(
+                question,
+                citations,
+                legal_object,
+                None,
+                known_ids,
+                failures,
+            )
+            warnings.extend(repair_issues)
+            if repair_success:
+                warnings.append(
+                    {
+                        "code": "GROUNDING_REPAIRED",
+                        "message": "Answer required grounding repair; a corrected answer was produced.",
+                    }
+                )
+                return repaired_answer, warnings
+
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids)
+            warnings.append(
+                {
+                    "code": "GROUNDING_PATCHED",
+                    "message": "Unsupported bullets were replaced due to insufficient evidence.",
+                }
+            )
+            return patched_answer, warnings
 
         warnings.extend(issues)
 
@@ -396,8 +605,43 @@ def _single_pass_answer(
         answer2 = _call_ollama_chat(corrective, user_prompt)
         ok2, issues2, _unknown2 = _validate_answer(answer2, known_ids)
         if ok2:
-            warnings.append({"code": "REPAIRED_OUTPUT", "message": "Model output required repair; a corrected answer was produced."})
-            return answer2, warnings
+            grounding_ok, failures = verify_grounding(answer2, citations)
+            _log_grounding_result(grounding_ok, failures)
+            if grounding_ok:
+                warnings.append(
+                    {
+                        "code": "REPAIRED_OUTPUT",
+                        "message": "Model output required repair; a corrected answer was produced.",
+                    }
+                )
+                return answer2, warnings
+
+            repaired_answer, repair_success, repair_failures, repair_issues = _attempt_grounding_repair(
+                question,
+                citations,
+                legal_object,
+                None,
+                known_ids,
+                failures,
+            )
+            warnings.extend(repair_issues)
+            if repair_success:
+                warnings.append(
+                    {
+                        "code": "GROUNDING_REPAIRED",
+                        "message": "Answer required grounding repair; a corrected answer was produced.",
+                    }
+                )
+                return repaired_answer, warnings
+
+            patched_answer = _patch_unsupported_bullets(repaired_answer, repair_failures, known_ids)
+            warnings.append(
+                {
+                    "code": "GROUNDING_PATCHED",
+                    "message": "Unsupported bullets were replaced due to insufficient evidence.",
+                }
+            )
+            return patched_answer, warnings
 
         warnings.extend(issues2)
         warnings.append({"code": "FALLBACK_USED", "message": "Model output could not be validated. Falling back to conservative template."})
