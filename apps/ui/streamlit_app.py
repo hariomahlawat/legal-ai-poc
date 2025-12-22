@@ -1,5 +1,7 @@
 import json
+import re
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import streamlit as st
@@ -8,6 +10,37 @@ from apps.ui.client.api_client import APIClient
 
 APP_TITLE = "SDD Legal AI System (PoC)"
 BACKEND_DEFAULT = "http://127.0.0.1:8000"
+CITATION_PATTERN = re.compile(r"\[([A-Za-z]+-[A-Za-z0-9]+)\]")
+
+
+# === Citation Helpers ===
+
+
+def parse_citation_ids(text: str) -> List[str]:
+    seen = set()
+    found: List[str] = []
+    for match in CITATION_PATTERN.findall(text or ""):
+        if match not in seen:
+            seen.add(match)
+            found.append(match)
+    return found
+
+
+def _format_score(value: Optional[float]) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}"
+
+
+def _format_focus(value: Optional[bool]) -> str:
+    if value is None:
+        return "n/a"
+    return "Yes" if value else "No"
+
+
+def _short_heading_path(heading_path: str) -> str:
+    parts = [p.strip() for p in (heading_path or "").split(">") if p.strip()]
+    return parts[-1] if parts else heading_path.strip()
 
 
 def parse_sse_lines(resp) -> Iterator[Tuple[str, Any]]:
@@ -89,14 +122,82 @@ def backend_settings_panel() -> Tuple[APIClient, Dict[str, Any]]:
 
 def init_state():
     if "messages" not in st.session_state:
-        st.session_state["messages"] = []  # list of dicts {role, content}
+        st.session_state["messages"] = []  # list of dicts {role, content, citations?}
     if "last_citations" not in st.session_state:
         st.session_state["last_citations"] = []
     if "last_warnings" not in st.session_state:
         st.session_state["last_warnings"] = []
+    if "citation_cache" not in st.session_state:
+        st.session_state["citation_cache"] = {}
 
 
-def render_messages():
+# === Evidence Rendering ===
+
+
+def _fetch_citation_detail(client: APIClient, citation_id: str) -> Dict[str, Any]:
+    cache = st.session_state.get("citation_cache", {})
+    if citation_id in cache:
+        return cache[citation_id]
+
+    try:
+        detail = client.get_citation(citation_id, timeout=10)
+        cache[citation_id] = {"data": detail}
+    except Exception as exc:  # pragma: no cover - network/IO dependent
+        cache[citation_id] = {"error": str(exc)}
+
+    st.session_state["citation_cache"] = cache
+    return cache[citation_id]
+
+
+def _render_evidence_for_message(message: Dict[str, Any], client: APIClient) -> None:
+    if not st.session_state.get("show_citations", True):
+        return
+
+    citations = message.get("citations") or []
+    if not citations:
+        return
+
+    st.subheader("Evidence")
+    for citation_id in citations:
+        detail_entry = _fetch_citation_detail(client, citation_id)
+        error_message = detail_entry.get("error")
+        detail = detail_entry.get("data", {}) if isinstance(detail_entry, dict) else {}
+
+        heading_path = detail.get("heading_path") or detail.get("location") or ""
+        heading_short = _short_heading_path(heading_path)
+        source_file = detail.get("source_file") or ""
+        source_basename = Path(source_file).name if source_file else "unknown"
+
+        expander_title = f"{citation_id} | {source_basename} | {heading_short or 'N/A'}"
+        with st.expander(expander_title):
+            if error_message:
+                st.info("Evidence not available")
+                st.caption(error_message)
+                continue
+
+            st.caption(f"Source file: {source_file or 'n/a'}")
+            st.caption(f"Heading path: {heading_path or 'n/a'}")
+
+            why_line = (
+                f"**Why retrieved:** "
+                f"Retrieval score: {_format_score(detail.get('retrieval_score'))} | "
+                f"Rerank score: {_format_score(detail.get('rerank_score'))} | "
+                f"Hit query count: {detail.get('hit_query_count') if detail.get('hit_query_count') is not None else 'n/a'} | "
+                f"Focus applied: {_format_focus(detail.get('focus_applied'))}"
+            )
+            st.markdown(why_line)
+
+            evidence_text = detail.get("text") or detail.get("verbatim") or detail.get("snippet") or ""
+            if evidence_text:
+                st.code(evidence_text)
+            else:
+                st.info("Evidence not available")
+
+
+# === Message Rendering ===
+
+
+def render_messages(client: APIClient):
     for m in st.session_state["messages"]:
         role = m.get("role", "")
         content = m.get("content", "")
@@ -104,16 +205,7 @@ def render_messages():
             st.markdown(f"🧑 **{content}**")
         else:
             st.markdown(f"🤖 {content}")
-
-
-def render_citations():
-    st.subheader("Citations")
-    cits = st.session_state.get("last_citations") or []
-    if not cits:
-        st.caption("No citations for the last answer.")
-        return
-    for c in cits:
-        st.write(c)
+            _render_evidence_for_message(m, client)
 
 
 def render_warnings():
@@ -123,6 +215,9 @@ def render_warnings():
     st.subheader("Compliance warnings")
     for w in warnings:
         st.warning(w)
+
+
+# === Application Entry Point ===
 
 
 def main():
@@ -135,7 +230,7 @@ def main():
     st.caption("Chat-style UI with grounded answers. FastAPI backend on port 8000.")
 
     st.header("Chat")
-    render_messages()
+    render_messages(client)
 
     user_text = st.chat_input("Ask a question")
     if user_text:
@@ -180,7 +275,11 @@ def main():
             if not final_answer:
                 final_answer = "(No answer received.)"
 
-            st.session_state["messages"].append({"role": "assistant", "content": final_answer})
+            citation_ids = parse_citation_ids(final_answer)
+
+            st.session_state["messages"].append(
+                {"role": "assistant", "content": final_answer, "citations": citation_ids}
+            )
             placeholder.empty()
             st.rerun()
 
@@ -190,9 +289,6 @@ def main():
 
     if st.session_state.get("show_compliance", True):
         render_warnings()
-
-    if st.session_state.get("show_citations", True):
-        render_citations()
 
 
 if __name__ == "__main__":
