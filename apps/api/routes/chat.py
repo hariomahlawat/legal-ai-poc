@@ -9,7 +9,8 @@ from pydantic import BaseModel
 
 from apps.api.services.citation_store import citation_store
 from apps.api.services.intent import classify_legal_object
-from apps.api.services.retrieval import retrieve_citations
+from apps.api.services.query_expansion import expand_queries
+from apps.api.services.retrieval import retrieve_citations_multi
 from apps.api.services.retrieval_repo import retrieve_repo_citations
 from apps.api.services.router import route_domain
 from apps.api.services.synthesis import synthesize_answer_grounded
@@ -187,14 +188,9 @@ def chat_stream(req: ChatRequest):
         # --- Retrieval and synthesis ---
         try:
             # 1) Retrieve evidence (RAG), constrained by legal object (soft)
-            retrieval_query = intent.normalized_query
-            if intent.legal_object == "Court of Inquiry":
-                # Expand acronym to improve recall and reduce Court-Martial drift.
-                if "court of inquiry" not in retrieval_query:
-                    retrieval_query = retrieval_query.replace("coi", "court of inquiry")
-                    retrieval_query = retrieval_query + " court of inquiry"
-            citations = retrieve_citations(
-                question=retrieval_query,
+            queries = expand_queries(question, intent.legal_object)
+            citations = retrieve_citations_multi(
+                questions=queries,
                 top_k=10,
                 legal_object=intent.legal_object,
             )
