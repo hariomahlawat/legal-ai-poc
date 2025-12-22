@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -7,6 +9,12 @@ import json
 import pickle
 import re
 import threading
+
+from apps.api.services.rerank import (
+    RERANK_ENABLED,
+    RERANK_TOP_N,
+    rerank_candidates,
+)
 
 
 # ----------------------------
@@ -104,6 +112,21 @@ def _soft_intent_boost(legal_object: Optional[str], chunk: _Chunk) -> float:
     return 0.0
 
 
+def _focus_terms_for_object(legal_object: Optional[str]) -> List[str]:
+    """Return focus terms based on the detected legal object."""
+    if not legal_object:
+        return []
+
+    lo = legal_object.lower()
+    if "court of inquiry" in lo or "coi" == lo:
+        return ["court of inquiry", "coi"]
+    if "court-martial" in lo or "court martial" in lo:
+        return ["court-martial", "court martial"]
+    if "disciplinary" in lo:
+        return ["disciplinary", "charge", "punishment"]
+    return []
+
+
 class _RetrievalState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -120,6 +143,9 @@ class _RetrievalState:
 
 
 _STATE = _RetrievalState()
+
+
+logger = logging.getLogger(__name__)
 
 
 def _load_meta_jsonl(path: Path) -> List[_Chunk]:
@@ -420,14 +446,78 @@ def retrieve_citations_multi(
 
     if not final_scores:
         return []
-
-    # Sort by fused score
+    # Sort by fused score (retrieval ranking)
     scored = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
-    top_indices = [i for i, _ in scored[: max(top_k, 1)]]
+
+    # Build candidate set with retrieval metadata
+    candidates_all: List[Dict[str, Any]] = []
+    for i, score in scored:
+        ch = _STATE.bm25_meta[i]
+        candidates_all.append(
+            {
+                "chunk_index": i,
+                "chunk": ch,
+                "heading_path": ch.heading_path,
+                "text": ch.text,
+                "source_file": ch.source_file,
+                "retrieval_score": float(score),
+                "hit_query_count": len(hit_queries.get(i, [])),
+            }
+        )
+
+    # ----------------------------
+    # Conditional focus filtering
+    # ----------------------------
+    focus_terms = _focus_terms_for_object(legal_object)
+    candidates_focus: List[Dict[str, Any]] = []
+    if focus_terms:
+        for cand in candidates_all:
+            hp = (cand.get("heading_path") or "").lower()
+            txt = (cand.get("text") or "").lower()
+            if any(term in hp or term in txt for term in focus_terms):
+                candidates_focus.append(cand)
+
+    candidates_for_ranking = candidates_all
+    focus_applied = False
+    if focus_terms and len(candidates_focus) >= top_k * 5:
+        candidates_for_ranking = candidates_focus
+        focus_applied = True
+
+    logger.info(
+        "retrieval.focus_filter applied=%s before=%d after=%d",
+        focus_applied,
+        len(candidates_all),
+        len(candidates_for_ranking),
+    )
+
+    # ----------------------------
+    # Cross-encoder reranking
+    # ----------------------------
+    rerank_top_n = max(1, RERANK_TOP_N)
+    rerank_candidates_input = candidates_for_ranking[:rerank_top_n]
+    rerank_start = time.perf_counter()
+    reranked = rerank_candidates(
+        question=normalized_questions[0],
+        candidates=rerank_candidates_input,
+        top_k=top_k,
+    )
+    rerank_latency_ms = (time.perf_counter() - rerank_start) * 1000.0
+    logger.info(
+        "retrieval.rerank rerank_enabled=%s rerank_top_n=%d latency_ms=%.2f",
+        RERANK_ENABLED,
+        rerank_top_n,
+        rerank_latency_ms,
+    )
+
+    if not reranked:
+        reranked = candidates_for_ranking[:top_k]
+
+    final_candidates = reranked
 
     out: List[Dict[str, Any]] = []
-    for i in top_indices:
-        ch = _STATE.bm25_meta[i]
+    for cand in final_candidates:
+        ch = cand.get("chunk") or _STATE.bm25_meta[cand.get("chunk_index", 0)]
+        i = cand.get("chunk_index", 0)
 
         before = ""
         after = ""
@@ -459,8 +549,10 @@ def retrieve_citations_multi(
                 "context_before": (before or "").strip(),
                 "context_after": (after or "").strip(),
                 "snippet": snippet,
-                "retrieval_score": final_scores.get(i, 0.0),
-                "hit_query_count": len(hit_queries.get(i, [])),
+                "retrieval_score": cand.get("retrieval_score", 0.0),
+                "hit_query_count": cand.get("hit_query_count", 0),
+                "focus_applied": focus_applied,
+                "rerank_score": cand.get("rerank_score"),
             }
         )
 
