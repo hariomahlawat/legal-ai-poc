@@ -16,7 +16,7 @@ from apps.api.services.intent import classify_legal_object
 from apps.api.services.query_expansion import expand_queries
 from apps.api.services.router import route_domain
 from apps.api.services.rerank import RERANK_ENABLED, RERANKER_MODEL, RERANK_TOP_N
-from apps.api.services.retrieval import retrieve_citations_multi
+from apps.api.services.retrieval import get_legal_index_info, retrieve_citations_multi
 from apps.api.services.retrieval_repo import retrieve_repo_citations
 from apps.api.services.synthesis import TWO_PASS_ENABLED, synthesize_answer_grounded
 from apps.api.services.synthesis_repo import synthesize_repo_answer_grounded
@@ -287,6 +287,9 @@ def _apply_gates(summary: Dict[str, Any], mode: str, config: Dict[str, Any]) -> 
 # Reporting utilities
 # =====================
 def _environment_settings() -> Dict[str, Any]:
+    legal_index = get_legal_index_info()
+    manifest = legal_index.get("manifest") or {}
+
     return {
         "reranker_enabled": RERANK_ENABLED,
         "reranker_model": RERANKER_MODEL,
@@ -294,6 +297,9 @@ def _environment_settings() -> Dict[str, Any]:
         "two_pass_enabled": TWO_PASS_ENABLED,
         "legal_top_k": 8,
         "system_top_k": 6,
+        "legal_index_version": legal_index.get("version"),
+        "legal_chunk_max_chars": manifest.get("max_chars"),
+        "legal_chunk_overlap_chars": manifest.get("overlap_chars"),
     }
 
 
