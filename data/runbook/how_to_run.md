@@ -15,7 +15,7 @@
 - Default port: 8000. Change with `--port <port>`.
 
 ## Start Streamlit UI
-- Command (from repo root): `streamlit run apps/ui/main.py --server.port 8501 --server.address 0.0.0.0`.
+- Command (from repo root): `streamlit run apps/ui/streamlit_app.py --server.port 8501`.
 - Default port: 8501. Change with `--server.port <port>`.
 
 ## Health Checks
