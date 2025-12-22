@@ -1,6 +1,5 @@
 import json
 import logging
-import time
 from typing import Any, Dict, Iterator, List, Literal, Optional
 
 from fastapi import APIRouter
@@ -16,6 +15,9 @@ from apps.api.services.router import route_domain
 from apps.api.services.synthesis import synthesize_answer_grounded
 from apps.api.services.synthesis_repo import synthesize_repo_answer_grounded
 
+# ---------------------------------------------------------------------------
+# Router setup
+# ---------------------------------------------------------------------------
 router = APIRouter()
 
 Role = Literal["system", "user", "assistant"]
@@ -23,6 +25,9 @@ Role = Literal["system", "user", "assistant"]
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Request/response models
+# ---------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: Role
     content: str
@@ -36,6 +41,9 @@ class ChatRequest(BaseModel):
     want_warnings: Optional[bool] = True
 
 
+# ---------------------------------------------------------------------------
+# SSE helpers
+# ---------------------------------------------------------------------------
 def sse_event(event: str, data: Dict[str, Any]) -> bytes:
     """
     SSE format:
@@ -46,6 +54,29 @@ def sse_event(event: str, data: Dict[str, Any]) -> bytes:
     return payload.encode("utf-8")
 
 
+def stream_tokens(text: str, chunk_size: int = 64) -> Iterator[str]:
+    """Yield text in whitespace-aware chunks suitable for SSE streaming."""
+
+    buffer: List[str] = []
+    current_len = 0
+
+    for word in (text or "").split():
+        word_len = len(word) + 1  # include space
+        if current_len + word_len > chunk_size and buffer:
+            yield " ".join(buffer)
+            buffer = [word]
+            current_len = word_len
+        else:
+            buffer.append(word)
+            current_len += word_len
+
+    if buffer:
+        yield " ".join(buffer)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 @router.post("/chat/stream")
 def chat_stream(req: ChatRequest):
     def gen() -> Iterator[bytes]:
@@ -58,8 +89,8 @@ def chat_stream(req: ChatRequest):
 
         if not question:
             yield sse_event("meta", {"case_id": req.case_id, "mode": req.mode})
-            for ch in "No question provided.":
-                yield sse_event("token", {"text": ch})
+            for chunk in stream_tokens("No question provided."):
+                yield sse_event("token", {"text": chunk})
             yield sse_event("citations", {"items": []})
             yield sse_event("warnings", {"items": [{"code": "NO_QUESTION", "message": "No question provided."}]})
             yield sse_event("done", {"ok": True})
@@ -91,9 +122,8 @@ def chat_stream(req: ChatRequest):
                 answer_text = "Unable to retrieve system help at this time."
                 citations = []
 
-            for ch in answer_text:
-                yield sse_event("token", {"text": ch})
-                time.sleep(0.001)
+            for chunk in stream_tokens(answer_text):
+                yield sse_event("token", {"text": chunk})
 
             if req.want_citations:
                 yield sse_event(
@@ -133,9 +163,8 @@ def chat_stream(req: ChatRequest):
                 "The request is too vague to answer safely. Please specify the legal context (Court of Inquiry, "
                 "Court-Martial, or general service matter) and what outcome you need (procedure, drafting, or references)."
             )
-            for ch in clarify:
-                yield sse_event("token", {"text": ch})
-                time.sleep(0.001)
+            for chunk in stream_tokens(clarify):
+                yield sse_event("token", {"text": chunk})
 
             if req.want_citations:
                 yield sse_event("citations", {"items": []})
@@ -164,9 +193,8 @@ def chat_stream(req: ChatRequest):
         # If ambiguous, ask a clarification question instead of guessing.
         if intent.needs_clarification and intent.clarification_question:
             clarification = intent.clarification_question.strip()
-            for ch in clarification:
-                yield sse_event("token", {"text": ch})
-                time.sleep(0.001)
+            for chunk in stream_tokens(clarification):
+                yield sse_event("token", {"text": chunk})
 
             if req.want_citations:
                 yield sse_event("citations", {"items": []})
@@ -240,9 +268,8 @@ def chat_stream(req: ChatRequest):
             )
 
         # Stream token-by-token (char) for PoC
-        for ch in answer_text:
-            yield sse_event("token", {"text": ch})
-            time.sleep(0.001)
+        for chunk in stream_tokens(answer_text):
+            yield sse_event("token", {"text": chunk})
 
         # Return citations (card list)
         if req.want_citations:
