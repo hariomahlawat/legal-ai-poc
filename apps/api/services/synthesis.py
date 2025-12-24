@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Iterator
 import json
 import logging
 import os
@@ -491,6 +491,7 @@ def _attempt_grounding_repair(
     plan: Optional[Dict[str, Any]],
     known_ids: set[str],
     failures: List[Dict[str, Any]],
+    request_id: str = "unknown",
 ) -> Tuple[str, bool, List[Dict[str, Any]], List[Dict[str, str]]]:
     base_user_prompt = _build_user_prompt(question, citations, legal_object)
     plan_block = ""
