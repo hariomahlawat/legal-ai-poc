@@ -10,7 +10,7 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from apps.api.config import OLLAMA_MODEL_LEGAL, SYNTHESIS_MAX_CITATIONS
+from apps.api.config import OLLAMA_MODEL_LEGAL, OLLAMA_NUM_PREDICT, OLLAMA_TEMPERATURE, SYNTHESIS_MAX_CITATIONS
 from apps.api.services.citation_store import upsert_citations
 from apps.api.services.expand_queries import expand_queries
 from apps.api.services.ollama_client import (
@@ -124,10 +124,16 @@ def chat_stream(req: ChatRequest) -> StreamingResponse:
             ]
 
             answer_parts: List[str] = []
+            # ----------------------------
+            # Streaming options
+            # ----------------------------
             for chunk in ollama_chat_stream(
                 model=OLLAMA_MODEL_LEGAL,
                 messages=messages,
-                options={},
+                options={
+                    "num_predict": OLLAMA_NUM_PREDICT,
+                    "temperature": OLLAMA_TEMPERATURE,
+                },
                 request_id=req.case_id or "default",
             ):
                 answer_parts.append(chunk)

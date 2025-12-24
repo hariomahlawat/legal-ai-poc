@@ -10,7 +10,9 @@ import requests
 from apps.api.config import (
     OLLAMA_CONNECT_TIMEOUT_SECS,
     OLLAMA_FAILURE_COOLDOWN_SECS,
+    OLLAMA_NUM_PREDICT,
     OLLAMA_READ_TIMEOUT_SECS,
+    OLLAMA_TEMPERATURE,
     OLLAMA_URL,
 )
 
@@ -62,7 +64,10 @@ def ollama_chat(model: str, messages: List[Dict[str, Any]], options: Dict[str, A
     """
     if _should_short_circuit():
         raise OllamaConnectionError("Recent Ollama failures detected; skipping request until cooldown expires.")
-
+   
+    # ----------------------------
+    # Payload
+    # ----------------------------
     payload = {
         "model": model,
         "messages": messages,
@@ -73,11 +78,14 @@ def ollama_chat(model: str, messages: List[Dict[str, Any]], options: Dict[str, A
         },
     }
 
+    # ----------------------------
+    # Defaults
+    # ----------------------------
     # Fill defaults if missing
     if payload["options"]["num_predict"] is None:
-        payload["options"]["num_predict"] = 700
+        payload["options"]["num_predict"] = OLLAMA_NUM_PREDICT
     if payload["options"]["temperature"] is None:
-        payload["options"]["temperature"] = 0.2
+        payload["options"]["temperature"] = OLLAMA_TEMPERATURE
 
     try:
         resp = requests.post(
@@ -92,15 +100,19 @@ def ollama_chat(model: str, messages: List[Dict[str, Any]], options: Dict[str, A
         return content
     except requests.exceptions.ConnectTimeout as exc:
         _mark_failure()
+        logger.warning("ollama_chat.connect_timeout request_id=%s error=%s", request_id, exc)
         raise OllamaTimeoutError(f"Connect timeout to Ollama: {exc}") from exc
     except requests.exceptions.ReadTimeout as exc:
         _mark_failure()
+        logger.warning("ollama_chat.read_timeout request_id=%s error=%s", request_id, exc)
         raise OllamaTimeoutError(f"Read timeout from Ollama: {exc}") from exc
     except requests.exceptions.RequestException as exc:
         _mark_failure()
+        logger.warning("ollama_chat.request_error request_id=%s error=%s", request_id, exc)
         raise OllamaConnectionError(f"Ollama request failed: {exc}") from exc
     except ValueError as exc:
         _mark_failure()
+        logger.warning("ollama_chat.invalid_json request_id=%s error=%s", request_id, exc)
         raise OllamaResponseError(f"Invalid JSON from Ollama: {exc}") from exc
 
 
@@ -121,6 +133,9 @@ def ollama_chat_stream(
     if _should_short_circuit():
         raise OllamaConnectionError("Recent Ollama failures detected; skipping request until cooldown expires.")
 
+    # ----------------------------
+    # Payload
+    # ----------------------------
     payload = {
         "model": model,
         "messages": messages,
@@ -131,11 +146,14 @@ def ollama_chat_stream(
         },
     }
 
+    # ----------------------------
+    # Defaults
+    # ----------------------------
     # Fill defaults if missing
     if payload["options"]["num_predict"] is None:
-        payload["options"]["num_predict"] = 700
+        payload["options"]["num_predict"] = OLLAMA_NUM_PREDICT
     if payload["options"]["temperature"] is None:
-        payload["options"]["temperature"] = 0.2
+        payload["options"]["temperature"] = OLLAMA_TEMPERATURE
 
     url = f"{OLLAMA_URL}/api/chat"
 
@@ -192,10 +210,13 @@ def ollama_chat_stream(
 
     except requests.exceptions.ConnectTimeout as exc:
         _mark_failure()
+        logger.warning("ollama_chat_stream.connect_timeout request_id=%s error=%s", request_id, exc)
         raise OllamaTimeoutError(f"Connect timeout to Ollama: {exc}") from exc
     except requests.exceptions.ReadTimeout as exc:
         _mark_failure()
+        logger.warning("ollama_chat_stream.read_timeout request_id=%s error=%s", request_id, exc)
         raise OllamaTimeoutError(f"Read timeout from Ollama: {exc}") from exc
     except requests.exceptions.RequestException as exc:
         _mark_failure()
+        logger.warning("ollama_chat_stream.request_error request_id=%s error=%s", request_id, exc)
         raise OllamaConnectionError(f"Ollama request failed: {exc}") from exc
