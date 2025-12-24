@@ -28,6 +28,7 @@ from .ollama_client import (
     OllamaResponseError,
     OllamaTimeoutError,
     ollama_chat,
+    ollama_chat_stream,
 )
 
 from .citation_store import citation_store
@@ -1185,3 +1186,169 @@ def synthesize_answer_grounded(
     )
 
     return {"answer": answer, "warnings": warnings, "telemetry": telemetry, "citations": final_citations}
+
+
+class StreamingSynthesisHandle:
+    """Allows the API route to stream tokens first, then fetch warnings/telemetry after completion."""
+
+    def __init__(
+        self,
+        question: str,
+        citations: List[Dict[str, Any]],
+        legal_object: Optional[str],
+    ) -> None:
+        self.question = question
+        self.citations = citations
+        self.legal_object = legal_object
+
+        self.request_id = str(uuid.uuid4())
+        self._answer_parts: List[str] = []
+        self._warnings: List[Dict[str, str]] = []
+        self._telemetry: Dict[str, Any] = {
+            "streaming": True,
+            "two_pass_used": False,
+            "grounding_checked": False,
+            "validation_checked": False,
+        }
+        self._final_citations: List[Dict[str, Any]] = []
+        self._done: bool = False
+        self._started_at = time.monotonic()
+
+    def stream(self) -> Iterator[str]:
+        """Yield answer chunks. This method must be consumed to completion before result() is meaningful."""
+
+        if self._done:
+            # Do not stream twice
+            return
+
+        if not self.citations:
+            txt = _fallback_template(self.question, self.citations, self.legal_object)
+            self._warnings.append({"code": "NO_EVIDENCE", "message": "No evidence retrieved; returned a conservative template."})
+            self._answer_parts.append(txt)
+            self._final_citations = []
+            self._done = True
+            yield txt
+            return
+
+        # Keep prompt building identical to non-streaming path (single-pass only)
+        prompt_citations = _select_prompt_citations(self.citations)
+        self._final_citations = prompt_citations
+        known_ids = {c.get("citation_id", "") for c in prompt_citations if c.get("citation_id")}
+        allowed_ids_line = "Allowed citation IDs: " + ", ".join(sorted(known_ids))
+
+        user_prompt = _build_user_prompt(self.question, prompt_citations, self.legal_object)
+        evidence_length = len(user_prompt.split("EVIDENCE:\n", maxsplit=1)[-1])
+        full_text_length = sum(len((c.get("verbatim", "") or "")) for c in prompt_citations)
+        reduction_ratio = (evidence_length / full_text_length) if full_text_length else 0
+        logger.info(
+            "evidence_pack_built",
+            extra={
+                "request_id": self.request_id,
+                "citation_count": len(prompt_citations),
+                "total_citations": len(self.citations),
+                "evidence_length": evidence_length,
+                "full_text_length": full_text_length,
+                "reduction_ratio": round(reduction_ratio, 4) if reduction_ratio else 0,
+                "streaming": True,
+            },
+        )
+
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT_BASE},
+            {
+                "role": "user",
+                "content": f"{allowed_ids_line}\n\n{user_prompt}",
+            },
+        ]
+
+        try:
+            for chunk in ollama_chat_stream(
+                model=OLLAMA_MODEL_LEGAL,
+                messages=messages,
+                options={
+                    "temperature": OLLAMA_TEMPERATURE,
+                    "num_predict": OLLAMA_NUM_PREDICT,
+                },
+                request_id=self.request_id,
+            ):
+                self._answer_parts.append(chunk)
+                yield chunk
+        except OllamaTimeoutError as exc:
+            self._warnings.append({"code": "LLM_TIMEOUT", "message": str(exc)})
+            txt = _fallback_template(self.question, prompt_citations, self.legal_object)
+            self._answer_parts = [txt]
+            yield txt
+        except (OllamaConnectionError, OllamaResponseError, OllamaError) as exc:
+            self._warnings.append({"code": "LLM_UNAVAILABLE", "message": str(exc)})
+            txt = _fallback_template(self.question, prompt_citations, self.legal_object)
+            self._answer_parts = [txt]
+            yield txt
+        except Exception as exc:  # pragma: no cover
+            self._warnings.append({"code": "UNEXPECTED_ERROR", "message": f"Streaming synthesis failed: {exc}"})
+            txt = _fallback_template(self.question, prompt_citations, self.legal_object)
+            self._answer_parts = [txt]
+            yield txt
+        finally:
+            self._done = True
+
+            # Post-stream validation and grounding checks (cannot repair after streaming)
+            answer_text = "".join(self._answer_parts).strip()
+            try:
+                ok, issues, unknown_ids = _validate_answer(answer_text, known_ids)
+                self._telemetry["validation_checked"] = True
+                if not ok:
+                    self._warnings.append({
+                        "code": "VALIDATION_WARN",
+                        "message": f"Answer failed strict validation. Issues: {', '.join(i.get('code','') for i in issues)}",
+                    })
+                    if unknown_ids:
+                        self._warnings.append({
+                            "code": "UNKNOWN_CITATION_IDS",
+                            "message": "Answer contains citation IDs not present in evidence.",
+                        })
+
+                grounding_ok, failures = verify_grounding(answer_text, prompt_citations)
+                self._telemetry["grounding_checked"] = True
+                self._telemetry["grounding_failures"] = len(failures)
+                if not grounding_ok:
+                    self._warnings.append({
+                        "code": "GROUNDING_WARN",
+                        "message": "One or more procedure bullets could not be supported by cited evidence. Provide additional evidence or narrow the question.",
+                    })
+            except Exception as exc:  # pragma: no cover
+                self._warnings.append({"code": "POSTCHECK_ERROR", "message": f"Post-stream checks failed: {exc}"})
+
+            elapsed = time.monotonic() - self._started_at
+            logger.info(
+                "synthesis_request",
+                extra={
+                    "request_id": self.request_id,
+                    "model": OLLAMA_MODEL_LEGAL,
+                    "citations_used_for_prompt": len(prompt_citations),
+                    "prompt_chars_total": len(_SYSTEM_PROMPT_BASE) + len(user_prompt) + len(allowed_ids_line),
+                    "timeout_read_secs": OLLAMA_READ_TIMEOUT_SECS,
+                    "elapsed_secs": round(elapsed, 3),
+                    "streaming": True,
+                },
+            )
+
+    def result(self) -> Dict[str, Any]:
+        """Return warnings/telemetry after streaming has completed."""
+        answer_text = "".join(self._answer_parts).strip()
+        return {
+            "answer": answer_text,
+            "warnings": self._warnings,
+            "telemetry": self._telemetry,
+            "citations": self._final_citations,
+            "request_id": self.request_id,
+        }
+
+
+def synthesize_answer_grounded_stream(
+    question: str,
+    citations: List[Dict[str, Any]],
+    legal_object: Optional[str] = None,
+) -> StreamingSynthesisHandle:
+    """Streaming variant for /chat/stream. Uses single-pass generation and streams Ollama tokens end-to-end."""
+
+    return StreamingSynthesisHandle(question=question, citations=citations, legal_object=legal_object)

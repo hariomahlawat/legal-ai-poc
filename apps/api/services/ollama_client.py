@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Dict, Iterator, List
+from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
@@ -18,102 +18,156 @@ from apps.api.config import (
 
 logger = logging.getLogger(__name__)
 
-# Simple circuit-breaker state (process-level)
-_OLLAMA_HEALTHY = True
-_LAST_FAILURE_TS = 0.0
+
+# ============================
+# Circuit-breaker state
+# ============================
+_OLLAMA_HEALTHY: Optional[bool] = None
+_OLLAMA_LAST_FAILURE: Optional[float] = None
 
 
+# ============================
+# Exceptions
+# ============================
 class OllamaError(RuntimeError):
-    pass
-
-
-class OllamaConnectionError(OllamaError):
-    pass
+    """Base exception for Ollama client errors."""
 
 
 class OllamaTimeoutError(OllamaError):
-    pass
+    """Raised when Ollama request exceeds configured timeout."""
+
+
+class OllamaConnectionError(OllamaError):
+    """Raised when Ollama connection cannot be established."""
 
 
 class OllamaResponseError(OllamaError):
-    pass
+    """Raised when Ollama returns a non-successful response."""
 
 
-def _should_short_circuit() -> bool:
-    global _OLLAMA_HEALTHY, _LAST_FAILURE_TS
-    if _OLLAMA_HEALTHY:
-        return False
-    # cooldown window
-    return (time.time() - _LAST_FAILURE_TS) < float(OLLAMA_FAILURE_COOLDOWN_SECS)
+# ============================
+# Client helpers
+# ============================
+def _prompt_char_length(messages: List[Dict[str, Any]]) -> int:
+    return sum(len((m.get("content") or "")) for m in messages)
 
 
 def _mark_failure() -> None:
-    global _OLLAMA_HEALTHY, _LAST_FAILURE_TS
+    """Record a connectivity failure to activate the cool-down window."""
+    global _OLLAMA_HEALTHY, _OLLAMA_LAST_FAILURE
     _OLLAMA_HEALTHY = False
-    _LAST_FAILURE_TS = time.time()
+    _OLLAMA_LAST_FAILURE = time.monotonic()
 
 
 def _mark_success() -> None:
-    global _OLLAMA_HEALTHY
+    global _OLLAMA_HEALTHY, _OLLAMA_LAST_FAILURE
     _OLLAMA_HEALTHY = True
+    _OLLAMA_LAST_FAILURE = None
 
 
+def _should_short_circuit() -> bool:
+    """Determine if we should skip calling Ollama due to recent failures."""
+    if _OLLAMA_HEALTHY is False and _OLLAMA_LAST_FAILURE is not None:
+        elapsed = time.monotonic() - _OLLAMA_LAST_FAILURE
+        return elapsed < OLLAMA_FAILURE_COOLDOWN_SECS
+    return False
+
+
+def _merge_options(options: Dict[str, Any] | None) -> Dict[str, Any]:
+    final_options: Dict[str, Any] = {
+        "num_predict": OLLAMA_NUM_PREDICT,
+        "temperature": OLLAMA_TEMPERATURE,
+    }
+    if options:
+        final_options.update(options)
+    return final_options
+
+
+# ============================
+# Public API
+# ============================
 def ollama_chat(model: str, messages: List[Dict[str, Any]], options: Dict[str, Any], request_id: str) -> str:
-    """
-    Non-streaming chat call (kept for other internal calls if needed).
-    """
+    """Non-streaming call. This blocks until Ollama finishes the full response."""
+
     if _should_short_circuit():
-        raise OllamaConnectionError("Recent Ollama failures detected; skipping request until cooldown expires.")
-   
-    # ----------------------------
-    # Payload
-    # ----------------------------
+        raise OllamaConnectionError(
+            "Recent Ollama failures detected; skipping request until cooldown expires."
+        )
+
+    final_options = _merge_options(options)
+
     payload = {
         "model": model,
         "messages": messages,
         "stream": False,
-        "options": {
-            "num_predict": options.get("num_predict"),
-            "temperature": options.get("temperature"),
-        },
+        "options": final_options,
     }
 
-    # ----------------------------
-    # Defaults
-    # ----------------------------
-    # Fill defaults if missing
-    if payload["options"]["num_predict"] is None:
-        payload["options"]["num_predict"] = OLLAMA_NUM_PREDICT
-    if payload["options"]["temperature"] is None:
-        payload["options"]["temperature"] = OLLAMA_TEMPERATURE
+    start = time.monotonic()
+    prompt_chars = _prompt_char_length(messages)
 
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/chat",
             json=payload,
-            timeout=(float(OLLAMA_CONNECT_TIMEOUT_SECS), float(OLLAMA_READ_TIMEOUT_SECS)),
+            timeout=(OLLAMA_CONNECT_TIMEOUT_SECS, OLLAMA_READ_TIMEOUT_SECS),
         )
         resp.raise_for_status()
-        data = resp.json()
-        content = (data.get("message") or {}).get("content", "")
-        _mark_success()
-        return content
-    except requests.exceptions.ConnectTimeout as exc:
+    except requests.Timeout as exc:  # pragma: no cover
+        elapsed = time.monotonic() - start
         _mark_failure()
-        logger.warning("ollama_chat.connect_timeout request_id=%s error=%s", request_id, exc)
-        raise OllamaTimeoutError(f"Connect timeout to Ollama: {exc}") from exc
-    except requests.exceptions.ReadTimeout as exc:
+        logger.warning(
+            "ollama_timeout",
+            extra={
+                "request_id": request_id,
+                "model": model,
+                "prompt_chars": prompt_chars,
+                "num_predict": final_options.get("num_predict"),
+                "temperature": final_options.get("temperature"),
+                "elapsed_secs": round(elapsed, 3),
+                "timeout_read_secs": OLLAMA_READ_TIMEOUT_SECS,
+            },
+        )
+        raise OllamaTimeoutError(f"Ollama request timed out after {OLLAMA_READ_TIMEOUT_SECS}s") from exc
+    except requests.ConnectionError as exc:  # pragma: no cover
         _mark_failure()
-        logger.warning("ollama_chat.read_timeout request_id=%s error=%s", request_id, exc)
-        raise OllamaTimeoutError(f"Read timeout from Ollama: {exc}") from exc
-    except requests.exceptions.RequestException as exc:
+        logger.error(
+            "ollama_connection_error",
+            extra={"request_id": request_id, "model": model, "prompt_chars": prompt_chars},
+        )
+        raise OllamaConnectionError(f"Unable to reach Ollama at {OLLAMA_URL}") from exc
+    except requests.RequestException as exc:  # pragma: no cover
         _mark_failure()
-        logger.warning("ollama_chat.request_error request_id=%s error=%s", request_id, exc)
-        raise OllamaConnectionError(f"Ollama request failed: {exc}") from exc
-    except ValueError as exc:
-        _mark_failure()
-        logger.warning("ollama_chat.invalid_json request_id=%s error=%s", request_id, exc)
-        raise OllamaResponseError(f"Invalid JSON from Ollama: {exc}") from exc
+        logger.error(
+            "ollama_response_error",
+            extra={
+                "request_id": request_id,
+                "model": model,
+                "prompt_chars": prompt_chars,
+                "status_code": getattr(exc.response, "status_code", None),
+            },
+        )
+        raise OllamaResponseError(f"Ollama request failed: {exc}") from exc
+
+    elapsed = time.monotonic() - start
+    data = resp.json()
+    content = (data.get("message", {}) or {}).get("content", "").strip()
+    _mark_success()
+
+    logger.info(
+        "ollama_chat",
+        extra={
+            "request_id": request_id,
+            "model": model,
+            "prompt_chars": prompt_chars,
+            "num_predict": final_options.get("num_predict"),
+            "temperature": final_options.get("temperature"),
+            "elapsed_secs": round(elapsed, 3),
+            "timeout_read_secs": OLLAMA_READ_TIMEOUT_SECS,
+        },
+    )
+
+    return content
 
 
 def ollama_chat_stream(
@@ -123,100 +177,122 @@ def ollama_chat_stream(
     request_id: str,
 ) -> Iterator[str]:
     """
-    Streaming chat call.
+    Streaming call to Ollama.
 
-    Key change versus non-streaming:
-    - We set stream=True for Ollama.
-    - We DO NOT apply a per-read timeout. With streaming, long generations can legitimately exceed
-      OLLAMA_READ_TIMEOUT_SECS, and we want token flow to keep the connection alive.
+    Why this fixes the timeout:
+    - Non-streaming waits for the full response body to complete.
+    - Streaming reads line-delimited JSON events incrementally and yields content chunks.
+    - This keeps the SSE endpoint responsive and avoids waiting for full completion.
+
+    Notes:
+    - We keep connect timeout.
+    - For streaming, we enforce a higher read timeout than the non-streaming path,
+      because time-to-first-token can exceed 180s on large prompts with CPU-only inference.
     """
-    if _should_short_circuit():
-        raise OllamaConnectionError("Recent Ollama failures detected; skipping request until cooldown expires.")
 
-    # ----------------------------
-    # Payload
-    # ----------------------------
+    if _should_short_circuit():
+        raise OllamaConnectionError(
+            "Recent Ollama failures detected; skipping request until cooldown expires."
+        )
+
+    final_options = _merge_options(options)
     payload = {
         "model": model,
         "messages": messages,
         "stream": True,
-        "options": {
-            "num_predict": options.get("num_predict"),
-            "temperature": options.get("temperature"),
-        },
+        "options": final_options,
     }
 
-    # ----------------------------
-    # Defaults
-    # ----------------------------
-    # Fill defaults if missing
-    if payload["options"]["num_predict"] is None:
-        payload["options"]["num_predict"] = OLLAMA_NUM_PREDICT
-    if payload["options"]["temperature"] is None:
-        payload["options"]["temperature"] = OLLAMA_TEMPERATURE
+    start = time.monotonic()
+    prompt_chars = _prompt_char_length(messages)
 
-    url = f"{OLLAMA_URL}/api/chat"
-
-    start = time.time()
-    logger.info("ollama_chat_stream.start request_id=%s model=%s url=%s", request_id, model, url)
+    # Socket read timeout (waiting for bytes). This is not the total generation time.
+    stream_read_timeout = max(float(OLLAMA_READ_TIMEOUT_SECS), 600.0)
 
     try:
-        # IMPORTANT: no read timeout for streaming
         with requests.post(
-            url,
+            f"{OLLAMA_URL}/api/chat",
             json=payload,
             stream=True,
-            timeout=(float(OLLAMA_CONNECT_TIMEOUT_SECS), None),
+            timeout=(OLLAMA_CONNECT_TIMEOUT_SECS, stream_read_timeout),
         ) as resp:
             resp.raise_for_status()
 
-            # Iterate server-sent JSON lines from Ollama
-            for raw_line in resp.iter_lines(decode_unicode=True):
-                if not raw_line:
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw:
                     continue
 
                 try:
-                    data = json.loads(raw_line)
+                    obj = json.loads(raw)
                 except Exception:
-                    # Ignore malformed lines but keep stream alive
                     continue
 
-                if data.get("error"):
-                    raise OllamaResponseError(str(data.get("error")))
+                if isinstance(obj, dict) and obj.get("error"):
+                    raise OllamaResponseError(str(obj.get("error")))
 
-                # Ollama chat streaming emits {"message": {"content": "..."}, "done": false}
                 chunk = ""
-                msg = data.get("message") or {}
-                if isinstance(msg, dict):
-                    chunk = msg.get("content") or ""
-
-                # Fallback for /api/generate-style payloads if any
-                if not chunk:
-                    chunk = data.get("response") or ""
+                if isinstance(obj, dict):
+                    msg = obj.get("message") or {}
+                    if isinstance(msg, dict):
+                        chunk = (msg.get("content") or "")
+                    if not chunk:
+                        chunk = (obj.get("response") or "")
 
                 if chunk:
                     yield chunk
 
-                if data.get("done") is True:
+                if isinstance(obj, dict) and obj.get("done") is True:
                     break
 
         _mark_success()
+        elapsed = time.monotonic() - start
         logger.info(
-            "ollama_chat_stream.end request_id=%s model=%s elapsed_ms=%.2f",
-            request_id,
-            model,
-            (time.time() - start) * 1000.0,
+            "ollama_chat_stream",
+            extra={
+                "request_id": request_id,
+                "model": model,
+                "prompt_chars": prompt_chars,
+                "num_predict": final_options.get("num_predict"),
+                "temperature": final_options.get("temperature"),
+                "elapsed_secs": round(elapsed, 3),
+                "timeout_read_secs": stream_read_timeout,
+            },
         )
 
-    except requests.exceptions.ConnectTimeout as exc:
+    except requests.Timeout as exc:  # pragma: no cover
+        elapsed = time.monotonic() - start
         _mark_failure()
-        logger.warning("ollama_chat_stream.connect_timeout request_id=%s error=%s", request_id, exc)
-        raise OllamaTimeoutError(f"Connect timeout to Ollama: {exc}") from exc
-    except requests.exceptions.ReadTimeout as exc:
+        logger.warning(
+            "ollama_timeout",
+            extra={
+                "request_id": request_id,
+                "model": model,
+                "prompt_chars": prompt_chars,
+                "num_predict": final_options.get("num_predict"),
+                "temperature": final_options.get("temperature"),
+                "elapsed_secs": round(elapsed, 3),
+                "timeout_read_secs": stream_read_timeout,
+                "stream": True,
+            },
+        )
+        raise OllamaTimeoutError(f"Ollama streaming request timed out after {stream_read_timeout}s") from exc
+    except requests.ConnectionError as exc:  # pragma: no cover
         _mark_failure()
-        logger.warning("ollama_chat_stream.read_timeout request_id=%s error=%s", request_id, exc)
-        raise OllamaTimeoutError(f"Read timeout from Ollama: {exc}") from exc
-    except requests.exceptions.RequestException as exc:
+        logger.error(
+            "ollama_connection_error",
+            extra={"request_id": request_id, "model": model, "prompt_chars": prompt_chars, "stream": True},
+        )
+        raise OllamaConnectionError(f"Unable to reach Ollama at {OLLAMA_URL}") from exc
+    except requests.RequestException as exc:  # pragma: no cover
         _mark_failure()
-        logger.warning("ollama_chat_stream.request_error request_id=%s error=%s", request_id, exc)
-        raise OllamaConnectionError(f"Ollama request failed: {exc}") from exc
+        logger.error(
+            "ollama_response_error",
+            extra={
+                "request_id": request_id,
+                "model": model,
+                "prompt_chars": prompt_chars,
+                "status_code": getattr(exc.response, "status_code", None),
+                "stream": True,
+            },
+        )
+        raise OllamaResponseError(f"Ollama streaming request failed: {exc}") from exc
